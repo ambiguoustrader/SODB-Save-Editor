@@ -3246,6 +3246,2079 @@ SodbEditorApp.autofit_all_trees = _v6_autofit_all_trees
 SodbEditorApp.autofit_visible_tree = _v6_autofit_visible_tree
 SodbEditorApp.show_help = _v6_show_help
 
+# ---------------------------------------------------------------------------
+# v7 feature extension: optional Detective Mode, global search, timeline, map,
+# inventory/sync/apartment viewers, city stats, JSON inspector and lighter UI.
+# Detective Mode is hidden by default and can be enabled from the top toolbar.
+# ---------------------------------------------------------------------------
+
+
+def _v7_pos_tuple(value: Any) -> Optional[Tuple[float, float, float]]:
+    if isinstance(value, dict):
+        try:
+            return (float(value.get("x", 0.0)), float(value.get("y", 0.0)), float(value.get("z", 0.0)))
+        except Exception:
+            return None
+    return None
+
+
+def _v7_pos_label(value: Any) -> str:
+    p = _v7_pos_tuple(value)
+    if not p:
+        return "—"
+    return f"{p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}"
+
+
+def _v7_short(value: Any, limit: int = 900) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        text = str(value)
+    text = text.replace("\n", " ")
+    return text[:limit]
+
+
+def _v7_hay(*parts: Any) -> str:
+    return " ".join(str(x) for x in parts if x is not None).lower()
+
+
+def _v7_walk_limited(value: Any, path: str = "$", depth: int = 0, max_depth: int = 6, max_items: int = 3500):
+    """Yield (path, scalar_or_compact) pairs. Conservative, to keep search responsive."""
+    if max_items <= 0:
+        return
+    if depth > max_depth:
+        yield path, _v7_short(value, 350)
+        return
+    if isinstance(value, dict):
+        count = 0
+        for k, v in value.items():
+            if count >= 120:
+                break
+            count += 1
+            new_path = f"{path}.{k}" if path != "$" else str(k)
+            if isinstance(v, (dict, list)):
+                yield from _v7_walk_limited(v, new_path, depth + 1, max_depth, max_items - count)
+            else:
+                yield new_path, v
+    elif isinstance(value, list):
+        for i, v in enumerate(value[:120]):
+            new_path = f"{path}[{i}]"
+            if isinstance(v, (dict, list)):
+                yield from _v7_walk_limited(v, new_path, depth + 1, max_depth, max_items - i)
+            else:
+                yield new_path, v
+    else:
+        yield path, value
+
+
+# ----------------------------- Analyzer add-ons -----------------------------
+
+def _v7_city_statistics(self: SodbAnalyzer) -> List[Tuple[str, str, str]]:
+    obj = self.obj
+    total_cases = len(obj.get("activeCases", []) or []) + len(obj.get("archivedCases", []) or [])
+    murder_rows = list(obj.get("murders", []) or []) + list(obj.get("iaMurders", []) or [])
+    stats = [
+        ("build", str(obj.get("build", "—")), "Версия/билд сейва"),
+        ("saveTime", str(obj.get("saveTime", "—")), "Время сохранения"),
+        ("gameTime", str(round(float(obj.get("gameTime", 0) or 0), 3)), "Внутриигровое время"),
+        ("citizens", str(len(obj.get("citizens", []) or [])), "Все NPC"),
+        ("companies", str(len(obj.get("companies", []) or [])), "Компании"),
+        ("addresses", str(len(obj.get("addresses", []) or [])), "Локации/адреса"),
+        ("rooms", str(len(obj.get("rooms", []) or [])), "Комнаты"),
+        ("interactables", str(len(obj.get("interactables", []) or [])), "Предметы/объекты"),
+        ("evidence", str(len(obj.get("evidence", []) or [])), "Карточки evidence"),
+        ("cases", str(total_cases), "Активные + архивные дела"),
+        ("murders", str(len(murder_rows)), "murders + iaMurders"),
+        ("passcodes", str(len(obj.get("passcodes", []) or [])), "Сохранённые passcodes"),
+        ("keyring", str(len(obj.get("keyring", []) or [])), "Ключи игрока"),
+        ("firstPersonItems", str(len(obj.get("firstPersonItems", []) or [])), "Предметы в быстрых слотах"),
+        ("sync disks/upgrades", str(len(obj.get("upgrades", []) or [])), "Установленные апгрейды"),
+        ("currentMurderer", self.human_name(obj.get("currentMurderer")), "Текущий убийца, если есть"),
+        ("currentVictim", self.human_name(obj.get("currentVictim")), "Текущая жертва, если есть"),
+        ("player", f"{obj.get('playerFirstName', '')} {obj.get('playerSurname', '')}".strip() or "—", "Имя игрока"),
+        ("money", str(obj.get("money", "—")), "Деньги игрока"),
+    ]
+    try:
+        from collections import Counter
+        presets = Counter(str(it.get("p") or it.get("lp") or "unknown") for it in obj.get("interactables", []) if isinstance(it, dict))
+        for name, count in presets.most_common(12):
+            stats.append((f"item preset: {name}", str(count), "Топ interactables по preset"))
+    except Exception:
+        pass
+    return stats
+
+
+def _v7_murder_timeline(self: SodbAnalyzer) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for source, arr in (("murders", self.obj.get("murders", []) or []), ("iaMurders", self.obj.get("iaMurders", []) or [])):
+        for m in arr:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("murderID")
+            killer = m.get("murdererID")
+            victim = m.get("victimID")
+            address_id = m.get("addressID") if isinstance(m.get("addressID"), int) else m.get("victimSiteID")
+            rows.append({
+                "time": m.get("time", m.get("creationTime", "")),
+                "created": m.get("creationTime", ""),
+                "murder": f"Murder{mid}" if mid not in (None, "") else source,
+                "killer": self.human_name(killer),
+                "victim": self.human_name(victim),
+                "weapon": m.get("weaponStr") or m.get("weapon") or "—",
+                "preset": m.get("presetStr") or m.get("moStr") or "—",
+                "address": self.address_label(address_id) if isinstance(address_id, int) else "—",
+                "state": str(m.get("state", "—")),
+                "source": source,
+                "raw": m,
+            })
+    def sort_key(x: Dict[str, Any]) -> float:
+        try:
+            return float(x.get("time") or x.get("created") or 0)
+        except Exception:
+            return 0.0
+    return sorted(rows, key=sort_key)
+
+
+def _v7_inventory_infos(self: SodbAnalyzer, query: str = "") -> List[Dict[str, Any]]:
+    q = (query or "").strip().lower()
+    rows: List[Dict[str, Any]] = []
+    inter_by_id = {it.get("id"): it for it in self.obj.get("interactables", []) if isinstance(it, dict)}
+    for fp in self.obj.get("firstPersonItems", []) or []:
+        if not isinstance(fp, dict):
+            continue
+        iid = fp.get("interactableID")
+        it = inter_by_id.get(iid, {}) if iid is not None else {}
+        preset = it.get("p") or it.get("lp") or it.get("nEvKey") or fp.get("debugName") or "—"
+        room_id = it.get("r") if isinstance(it, dict) else None
+        owner_id = it.get("w") if isinstance(it, dict) else None
+        row = {
+            "kind": "slot",
+            "slot": fp.get("index", "—"),
+            "hotkey": fp.get("hotkey", "—"),
+            "id": str(iid),
+            "name": str(preset),
+            "owner": self.human_name(owner_id) if isinstance(owner_id, int) and owner_id > 0 else "—",
+            "room": self.room_label(room_id) if isinstance(room_id, int) else "—",
+            "raw": {"firstPersonItem": fp, "interactable": it},
+        }
+        if q and q not in _v7_hay(*row.values()):
+            continue
+        rows.append(row)
+    for i, kid in enumerate(self.obj.get("keyring", []) or []):
+        row = {"kind": "keyring", "slot": i, "hotkey": "—", "id": str(kid), "name": "Key", "owner": "—", "room": "—", "raw": {"keyringIndex": i, "key": kid}}
+        if q and q not in _v7_hay(*row.values()):
+            continue
+        rows.append(row)
+    carried = self.obj.get("carried")
+    if carried not in (None, -1, ""):
+        it = inter_by_id.get(carried, {})
+        row = {"kind": "carried", "slot": "current", "hotkey": "—", "id": str(carried), "name": str(it.get("p") or it.get("lp") or it.get("nEvKey") or "Interactable"), "owner": "player", "room": self.room_label(it.get("r")) if isinstance(it, dict) and isinstance(it.get("r"), int) else "—", "raw": {"carried": carried, "interactable": it}}
+        if not q or q in _v7_hay(*row.values()):
+            rows.insert(0, row)
+    return rows
+
+
+def _v7_sync_disk_infos(self: SodbAnalyzer, query: str = "") -> List[Dict[str, Any]]:
+    q = (query or "").strip().lower()
+    rows: List[Dict[str, Any]] = []
+    for idx, u in enumerate(self.obj.get("upgrades", []) or []):
+        if not isinstance(u, dict):
+            continue
+        row = {
+            "idx": idx,
+            "upgrade": str(u.get("upgrade", "—")),
+            "state": str(u.get("state", "—")),
+            "level": str(u.get("level", "—")),
+            "list": str(u.get("list", "—")),
+            "objId": str(u.get("objId", "—")),
+            "cost": str(u.get("uninstallCost", "—")),
+            "raw": u,
+        }
+        if q and q not in _v7_hay(*row.values()):
+            continue
+        rows.append(row)
+    return rows
+
+
+def _v7_apartment_infos(self: SodbAnalyzer, query: str = "") -> List[Dict[str, Any]]:
+    q = (query or "").strip().lower()
+    rooms_by_address: Dict[int, List[int]] = {}
+    for rid, aid in getattr(self, "room_address_map", {}).items():
+        if isinstance(rid, int) and isinstance(aid, int):
+            rooms_by_address.setdefault(aid, []).append(rid)
+    residents_by_address: Dict[int, List[str]] = {}
+    residents_by_room: Dict[int, List[str]] = {}
+    for p in self.person_infos():
+        for rid in p.raw.get("atHome", []) if isinstance(p.raw.get("atHome"), list) else []:
+            if isinstance(rid, int):
+                residents_by_room.setdefault(rid, []).append(self.human_name(p.cid))
+                aid = self.room_address_map.get(rid)
+                if isinstance(aid, int):
+                    residents_by_address.setdefault(aid, []).append(self.human_name(p.cid))
+        goal = p.raw.get("currentGoal") if isinstance(p.raw.get("currentGoal"), dict) else {}
+        if goal.get("isAddress") and isinstance(goal.get("gameLocation"), int) and goal.get("preset") in ("Home", "Sleep", "Relax", "AtHome"):
+            residents_by_address.setdefault(goal.get("gameLocation"), []).append(self.human_name(p.cid))
+    pass_by_room = {pc.target_id: pc.code for pc in self.password_infos() if pc.pc_type == 1}
+    rows: List[Dict[str, Any]] = []
+    all_addr_ids = set(self.address_by_id.keys()) | set(rooms_by_address.keys()) | set(residents_by_address.keys())
+    owned = set(x for x in self.obj.get("apartmentsOwned", []) or [] if isinstance(x, int))
+    residence = self.obj.get("residence")
+    for aid in sorted(x for x in all_addr_ids if isinstance(x, int)):
+        rooms = sorted(rooms_by_address.get(aid, []))[:60]
+        passcodes = [pass_by_room[r] for r in rooms if r in pass_by_room]
+        residents = []
+        residents.extend(residents_by_address.get(aid, []))
+        for r in rooms:
+            residents.extend(residents_by_room.get(r, []))
+        residents = list(dict.fromkeys(residents))
+        row = {
+            "address_id": f"Location{aid}",
+            "address": self.address_label(aid),
+            "rooms": ", ".join(f"Room{x}" for x in rooms[:12]) or "—",
+            "residents": ", ".join(residents[:12]) or "—",
+            "passwords": ", ".join(passcodes[:8]) or "—",
+            "owned": "yes" if aid in owned or aid == residence else "",
+            "raw": self.address_by_id.get(aid, {}),
+        }
+        if q and q not in _v7_hay(*row.values()):
+            continue
+        rows.append(row)
+    return rows
+
+
+def _v7_global_search(self: SodbAnalyzer, query: str, limit: int = 700) -> List[Dict[str, Any]]:
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    rows: List[Dict[str, Any]] = []
+
+    def add(section: str, ident: str, title: str, location: str, snippet: str, raw: Any) -> None:
+        if len(rows) >= limit:
+            return
+        rows.append({"section": section, "id": ident, "title": title, "location": location, "snippet": snippet, "raw": raw})
+
+    for p in self.person_infos():
+        text = _v7_hay(p.cid, p.name, p.role, p.flags, p.goal, p.location_id, p.position, self.password_status_for_human(p.cid), _v7_short(p.raw, 1400))
+        if q in text:
+            add("citizen", f"Human{p.cid}", p.name, self.location_label((p.raw.get("currentGoal") or {}).get("gameLocation") if isinstance(p.raw.get("currentGoal"), dict) else None, (p.raw.get("currentGoal") or {}).get("room") if isinstance(p.raw.get("currentGoal"), dict) else None), p.role or ", ".join(p.flags), p.raw)
+    for c in self.case_infos():
+        text = _v7_hay(c.cid, c.name, c.case_type, c.status, c.target_name, c.preset, c.short, _v7_short(c.raw, 2000))
+        if q in text:
+            add("case", f"Case{c.cid}", c.name, c.target_name, c.short, c.raw)
+    for pc in self.password_infos():
+        text = _v7_hay(pc.code, pc.pc_type, pc.target_name, pc.owner_hint, pc.notes)
+        if q in text:
+            add("passcode", str(pc.index), pc.code, pc.target_name, f"owner={pc.owner_hint}; used={pc.used}; notes={pc.notes}", pc.raw)
+    for comp in self.company_infos():
+        text = _v7_hay(comp.cid, comp.roster_id, comp.roles, comp.workers, comp.raw_company)
+        if q in text:
+            add("company", f"Company{comp.cid}", comp.roster_id, "—", "; ".join(f"{n} ({r})" for _hid, n, r in comp.workers[:8]), comp.raw_company)
+    for it in self.item_infos(query):
+        add("interactable", it.iid, f"{it.preset} {it.name}", it.address or it.room, f"owner={it.owner}; passcode={it.passcode}; evidence={it.evidence}", it.raw)
+    for a in self.address_room_infos(query, limit=150):
+        add("room/address", a.room_id, a.address, a.occupants, f"company={a.company}; password={a.password}; items={a.item_count}", a.raw)
+    for source in ("evidence", "interactables", "rooms", "addresses", "murders", "iaMurders", "messageThreads"):
+        arr = self.obj.get(source, []) or []
+        if not isinstance(arr, list):
+            continue
+        for i, x in enumerate(arr[:8000]):
+            if len(rows) >= limit:
+                return rows
+            if not isinstance(x, (dict, list, str, int, float, bool)):
+                continue
+            s = _v7_short(x, 1600)
+            if q in s.lower():
+                ident = str(x.get("id", i)) if isinstance(x, dict) else str(i)
+                title = str((x.get("n") or x.get("name") or x.get("presetStr") or x.get("p") or x.get("nEvKey") or source) if isinstance(x, dict) else source)
+                add(source, ident, title, "—", s[:500], x)
+    return rows
+
+
+SodbAnalyzer.city_statistics = _v7_city_statistics
+SodbAnalyzer.murder_timeline = _v7_murder_timeline
+SodbAnalyzer.inventory_infos = _v7_inventory_infos
+SodbAnalyzer.sync_disk_infos = _v7_sync_disk_infos
+SodbAnalyzer.apartment_infos = _v7_apartment_infos
+SodbAnalyzer.global_search = _v7_global_search
+
+
+# ------------------------------- GUI add-ons -------------------------------
+
+
+def _v7_setup_compact_style(self: SodbEditorApp) -> None:
+    _old_setup_style(self)
+    try:
+        style = ttk.Style(self)
+        style.configure("Detective.TFrame", background="#0e1118")
+        style.configure("Card.TFrame", background="#171d29")
+        style.configure("CardTitle.TLabel", background="#171d29", foreground="#ff9db7", font=("Segoe UI", 12, "bold"))
+        style.configure("CardHint.TLabel", background="#171d29", foreground="#aeb7c6", font=("Segoe UI", 9))
+    except Exception:
+        pass
+
+
+def _v7_build_ui(self: SodbEditorApp) -> None:
+    _v6_build_ui(self)
+    self.detective_mode_var = tk.BooleanVar(value=False)
+    self.detective_tab: Optional[ttk.Frame] = None
+    self.detective_nb: Optional[ttk.Notebook] = None
+    # Put a single toggle at the end of the existing toolbar. Detective tabs are lazy-built.
+    try:
+        children = self.winfo_children()
+        bar = children[1] if len(children) > 1 else None
+        if bar is not None:
+            ttk.Checkbutton(bar, text="Detective Mode", variable=self.detective_mode_var, command=self.toggle_detective_mode).pack(side="left", padx=8)
+    except Exception:
+        pass
+    self.bind_all("<Control-Shift-F>", lambda _e: self.open_detective_search())
+    self.bind_all("<Control-p>", lambda _e: self.open_detective_search())
+    try:
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self.after(120, self.autofit_visible_tree))
+    except Exception:
+        pass
+
+
+def _v7_toggle_detective_mode(self: SodbEditorApp) -> None:
+    if self.detective_mode_var.get():
+        if self.detective_tab is None:
+            self._build_detective_mode_tab()
+        # Add only if currently hidden.
+        tab_ids = list(self.nb.tabs())
+        if str(self.detective_tab) not in tab_ids:
+            self.nb.add(self.detective_tab, text="Detective Mode")
+        self.nb.select(self.detective_tab)
+        self.populate_detective_all()
+    else:
+        if self.detective_tab is not None:
+            try:
+                self.nb.forget(self.detective_tab)
+            except Exception:
+                pass
+
+
+def _v7_open_detective_search(self: SodbEditorApp) -> None:
+    if not getattr(self, "detective_mode_var", None):
+        return
+    self.detective_mode_var.set(True)
+    self.toggle_detective_mode()
+    try:
+        if self.detective_nb is not None:
+            self.detective_nb.select(self.det_global_tab)
+        self.det_search_entry.focus_set()
+    except Exception:
+        pass
+
+
+def _v7_text_in(parent: tk.Widget, wrap: str = "word") -> tk.Text:
+    frame = ttk.Frame(parent, style="Panel.TFrame")
+    frame.pack(fill="both", expand=True)
+    text = tk.Text(frame, wrap=wrap, bg="#0f1320", fg="#d8dde8", insertbackground="#ffffff", selectbackground="#8a3554", font=("Consolas", 10), relief="flat")
+    y = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+    x = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+    text.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+    text.grid(row=0, column=0, sticky="nsew")
+    y.grid(row=0, column=1, sticky="ns")
+    x.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+    return text
+
+
+def _v7_build_detective_mode_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.nb, style="Detective.TFrame")
+    self.detective_tab = tab
+    header = ttk.Frame(tab, style="Detective.TFrame")
+    header.pack(fill="x", padx=12, pady=(10, 6))
+    ttk.Label(header, text="Detective Mode", style="Title.TLabel").pack(side="left")
+    ttk.Label(header, text="  включаемая витрина: поиск, timeline, карта, inventory, sync disks, квартиры, статистика, JSON", style="Hint.TLabel").pack(side="left", padx=8)
+    ttk.Button(header, text="Обновить", command=self.populate_detective_all).pack(side="right", padx=3)
+    ttk.Button(header, text="Скрыть", command=lambda: (self.detective_mode_var.set(False), self.toggle_detective_mode())).pack(side="right", padx=3)
+
+    self.detective_nb = ttk.Notebook(tab)
+    self.detective_nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+    self._build_det_global_tab()
+    self._build_det_profile_tab()
+    self._build_det_timeline_tab()
+    self._build_det_map_tab()
+    self._build_det_inventory_tab()
+    self._build_det_sync_tab()
+    self._build_det_apartments_tab()
+    self._build_det_stats_tab()
+    self._build_det_json_tab()
+
+
+def _v7_build_det_global_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.det_global_tab = tab
+    self.detective_nb.add(tab, text="Поиск всего")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Ctrl+Shift+F / Ctrl+P:").pack(side="left")
+    self.det_search_var = tk.StringVar()
+    self.det_search_entry = ttk.Entry(toolbar, textvariable=self.det_search_var, width=48)
+    self.det_search_entry.pack(side="left", padx=6)
+    self.det_search_entry.bind("<Return>", lambda _e: self.run_global_search())
+    ttk.Button(toolbar, text="Искать", command=self.run_global_search).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Экспорт CSV", command=lambda: self._tree_to_csv(self.det_search_tree, "global_search.csv")).pack(side="left", padx=4)
+    ttk.Label(toolbar, text="Ищет по citizens, cases, passcodes, companies, items, rooms, evidence/interactables.", style="Hint.TLabel").pack(side="left", padx=10)
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Frame(paned, style="Panel.TFrame")
+    right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3); paned.add(right, weight=2)
+    cols = ("section", "id", "title", "location", "snippet")
+    self.det_search_tree = _v6_make_tree(left, cols, [("section", 110), ("id", 120), ("title", 260), ("location", 280), ("snippet", 540)], self.on_global_search_select)
+    self.det_search_details = _v7_text_in(right)
+    self._global_search_cache: List[Dict[str, Any]] = []
+
+
+def _v7_build_det_profile_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Карточка NPC")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="HumanID / имя:").pack(side="left")
+    self.det_profile_var = tk.StringVar()
+    ent = ttk.Entry(toolbar, textvariable=self.det_profile_var, width=42)
+    ent.pack(side="left", padx=6)
+    ent.bind("<Return>", lambda _e: self.show_detective_profile())
+    ttk.Button(toolbar, text="Показать", command=self.show_detective_profile).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Из выбранного в таблице людей", command=self.detective_profile_from_selected_person).pack(side="left", padx=4)
+    self.det_profile_text = _v7_text_in(tab, wrap="word")
+
+
+def _v7_build_det_timeline_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Timeline убийств")
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=10)
+    left = ttk.Frame(paned, style="Panel.TFrame"); right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3); paned.add(right, weight=2)
+    cols = ("time", "murder", "killer", "victim", "weapon", "address", "state")
+    self.timeline_tree = _v6_make_tree(left, cols, [("time", 80), ("murder", 90), ("killer", 210), ("victim", 210), ("weapon", 130), ("address", 320), ("state", 70)], self.on_timeline_select)
+    self.timeline_details = _v7_text_in(right)
+    self._timeline_cache: List[Dict[str, Any]] = []
+
+
+def _v7_build_det_map_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Карта / heatmap")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    self.map_show_people = tk.BooleanVar(value=True)
+    self.map_show_items = tk.BooleanVar(value=False)
+    self.map_show_murders = tk.BooleanVar(value=True)
+    self.map_show_heat = tk.BooleanVar(value=True)
+    for text, var in (("people", self.map_show_people), ("items", self.map_show_items), ("murders", self.map_show_murders), ("heat", self.map_show_heat)):
+        ttk.Checkbutton(toolbar, text=text, variable=var, command=self.draw_detective_map).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Перерисовать", command=self.draw_detective_map).pack(side="left", padx=8)
+    ttk.Label(toolbar, text="2D-проекция по координатам из сейва; без игровых текстур, чтобы не перегружать интерфейс.", style="Hint.TLabel").pack(side="left", padx=10)
+    self.det_map_canvas = tk.Canvas(tab, bg="#0f1320", highlightthickness=0)
+    self.det_map_canvas.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    self.det_map_canvas.bind("<Configure>", lambda _e: self.draw_detective_map())
+
+
+def _v7_build_det_inventory_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Инвентарь")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Фильтр:").pack(side="left")
+    self.inventory_filter = tk.StringVar()
+    ttk.Entry(toolbar, textvariable=self.inventory_filter, width=34).pack(side="left", padx=6)
+    self.inventory_filter.trace_add("write", lambda *_: self.populate_inventory())
+    ttk.Button(toolbar, text="Set carried from selected", command=self.set_carried_from_selected_inventory).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Экспорт CSV", command=lambda: self._tree_to_csv(self.inventory_tree, "inventory.csv")).pack(side="left", padx=4)
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Frame(paned, style="Panel.TFrame"); right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3); paned.add(right, weight=2)
+    cols = ("kind", "slot", "hotkey", "id", "name", "owner", "room")
+    self.inventory_tree = _v6_make_tree(left, cols, [("kind", 90), ("slot", 70), ("hotkey", 70), ("id", 130), ("name", 240), ("owner", 220), ("room", 300)], self.on_inventory_select)
+    self.inventory_details = _v7_text_in(right)
+    self._inventory_cache: List[Dict[str, Any]] = []
+
+
+def _v7_build_det_sync_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Sync disks")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Фильтр:").pack(side="left")
+    self.sync_filter = tk.StringVar()
+    ttk.Entry(toolbar, textvariable=self.sync_filter, width=34).pack(side="left", padx=6)
+    self.sync_filter.trace_add("write", lambda *_: self.populate_sync_disks())
+    ttk.Button(toolbar, text="Set level", command=self.set_selected_sync_level).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Set state", command=self.set_selected_sync_state).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Экспорт CSV", command=lambda: self._tree_to_csv(self.sync_tree, "sync_disks.csv")).pack(side="left", padx=4)
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Frame(paned, style="Panel.TFrame"); right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3); paned.add(right, weight=2)
+    cols = ("idx", "upgrade", "state", "level", "list", "objId", "cost")
+    self.sync_tree = _v6_make_tree(left, cols, [("idx", 60), ("upgrade", 260), ("state", 70), ("level", 70), ("list", 70), ("objId", 120), ("cost", 80)], self.on_sync_select)
+    self.sync_details = _v7_text_in(right)
+    self._sync_cache: List[Dict[str, Any]] = []
+
+
+def _v7_build_det_apartments_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Квартиры")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Фильтр:").pack(side="left")
+    self.apartment_filter = tk.StringVar()
+    ttk.Entry(toolbar, textvariable=self.apartment_filter, width=42).pack(side="left", padx=6)
+    self.apartment_filter.trace_add("write", lambda *_: self.populate_apartments())
+    ttk.Button(toolbar, text="Экспорт CSV", command=lambda: self._tree_to_csv(self.apartment_tree, "apartments.csv")).pack(side="left", padx=4)
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Frame(paned, style="Panel.TFrame"); right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3); paned.add(right, weight=2)
+    cols = ("address_id", "address", "rooms", "residents", "passwords", "owned")
+    self.apartment_tree = _v6_make_tree(left, cols, [("address_id", 105), ("address", 300), ("rooms", 250), ("residents", 360), ("passwords", 160), ("owned", 70)], self.on_apartment_select)
+    self.apartment_details = _v7_text_in(right)
+    self._apartment_cache: List[Dict[str, Any]] = []
+
+
+def _v7_build_det_stats_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Статистика")
+    cols = ("metric", "value", "note")
+    self.stats_tree = _v6_make_tree(tab, cols, [("metric", 270), ("value", 160), ("note", 620)])
+
+
+def _v7_build_det_json_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="JSON Inspector")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Поиск path/value:").pack(side="left")
+    self.json_inspector_search = tk.StringVar()
+    ent = ttk.Entry(toolbar, textvariable=self.json_inspector_search, width=44)
+    ent.pack(side="left", padx=6)
+    ent.bind("<Return>", lambda _e: self.search_json_inspector())
+    ttk.Button(toolbar, text="Искать", command=self.search_json_inspector).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Показать top-level", command=self.populate_json_inspector_top).pack(side="left", padx=4)
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Frame(paned, style="Panel.TFrame"); right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=2); paned.add(right, weight=3)
+    cols = ("path", "type", "summary")
+    self.json_tree = _v6_make_tree(left, cols, [("path", 260), ("type", 90), ("summary", 420)], self.on_json_inspector_select)
+    self.json_details = _v7_text_in(right)
+    self._json_cache: Dict[str, Any] = {}
+
+
+# ----------------------------- populate/actions -----------------------------
+
+def _v7_populate_detective_all(self: SodbEditorApp) -> None:
+    if not getattr(self, "detective_tab", None) or not self.analyzer:
+        return
+    self.populate_timeline()
+    self.populate_inventory()
+    self.populate_sync_disks()
+    self.populate_apartments()
+    self.populate_city_stats()
+    self.populate_json_inspector_top()
+    self.draw_detective_map()
+
+
+def _v7_run_global_search(self: SodbEditorApp) -> None:
+    if not self.analyzer:
+        return
+    q = self.det_search_var.get().strip()
+    self._global_search_cache = self.analyzer.global_search(q, limit=700)
+    self.det_search_tree.delete(*self.det_search_tree.get_children())
+    for i, r in enumerate(self._global_search_cache):
+        self.det_search_tree.insert("", "end", iid=str(i), values=(r["section"], r["id"], r["title"], r["location"], r["snippet"]))
+    self.after(80, lambda: self.autofit_tree(self.det_search_tree))
+    self.status_var.set(f"Global search: {len(self._global_search_cache)} результатов")
+
+
+def _v7_on_global_search_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.det_search_tree.selection() if hasattr(self, "det_search_tree") else []
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx >= len(getattr(self, "_global_search_cache", [])):
+        return
+    r = self._global_search_cache[idx]
+    self.det_search_details.delete("1.0", "end")
+    self.det_search_details.insert("1.0", f"{r['section']} | {r['id']} | {r['title']}\nLocation: {r['location']}\n\nRAW:\n" + json.dumps(r.get("raw"), ensure_ascii=False, indent=2)[:180_000])
+
+
+def _v7_find_person_from_query(self: SodbEditorApp, query: str) -> Optional[int]:
+    if not self.analyzer:
+        return None
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    hid = _v6_human_id_from_text(q)
+    if hid is not None:
+        return hid
+    if q.isdigit():
+        return int(q)
+    best = None
+    for p in self.analyzer.person_infos():
+        if q in (p.name or "").lower() or q in f"human{p.cid}".lower():
+            best = p.cid
+            if q == (p.name or "").lower():
+                break
+    return best
+
+
+def _v7_show_detective_profile(self: SodbEditorApp) -> None:
+    if not self.analyzer:
+        return
+    hid = self._find_person_from_query(self.det_profile_var.get())
+    self.det_profile_text.delete("1.0", "end")
+    if hid is None:
+        self.det_profile_text.insert("1.0", "Не нашёл человека. Введи HumanID, число, имя или фамилию.")
+        return
+    p = next((x for x in self.analyzer.person_infos() if x.cid == hid), None)
+    if not p:
+        self.det_profile_text.insert("1.0", f"Human{hid} не найден в citizens.")
+        return
+    # Reuse the full v6 person card, but add a short detective summary first.
+    rels = self.analyzer.person_relations(hid, limit=20)
+    summary = [
+        f"DETECTIVE PROFILE — {self.analyzer.human_name(hid)}",
+        "=" * 72,
+        f"Password: {self.analyzer.password_status_for_human(hid)}",
+        f"Relations: {len(rels)} shown / more in graph tab",
+        "",
+    ]
+    self.det_profile_text.insert("1.0", "\n".join(summary) + self.analyzer.pretty_person_details(p))
+
+
+def _v7_detective_profile_from_selected_person(self: SodbEditorApp) -> None:
+    sel = self.people_tree.selection() if hasattr(self, "people_tree") else []
+    if not sel:
+        messagebox.showinfo("NPC", "Выбери человека во вкладке «Люди / связи».")
+        return
+    vals = self.people_tree.item(sel[0], "values")
+    if vals:
+        self.det_profile_var.set(str(vals[0]))
+        self.show_detective_profile()
+
+
+def _v7_populate_timeline(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "timeline_tree"):
+        return
+    self._timeline_cache = self.analyzer.murder_timeline()
+    self.timeline_tree.delete(*self.timeline_tree.get_children())
+    for i, r in enumerate(self._timeline_cache):
+        self.timeline_tree.insert("", "end", iid=str(i), values=(r["time"], r["murder"], r["killer"], r["victim"], r["weapon"], r["address"], r["state"]))
+    self.after(80, lambda: self.autofit_tree(self.timeline_tree))
+
+
+def _v7_on_timeline_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.timeline_tree.selection() if hasattr(self, "timeline_tree") else []
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx >= len(getattr(self, "_timeline_cache", [])):
+        return
+    r = self._timeline_cache[idx]
+    self.timeline_details.delete("1.0", "end")
+    self.timeline_details.insert("1.0", f"{r['murder']}\nKiller: {r['killer']}\nVictim: {r['victim']}\nWeapon: {r['weapon']}\nAddress: {r['address']}\nPreset/MO: {r['preset']}\nSource: {r['source']}\n\nRAW:\n" + json.dumps(r.get("raw"), ensure_ascii=False, indent=2)[:140_000])
+
+
+def _v7_draw_detective_map(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "det_map_canvas"):
+        return
+    canvas = self.det_map_canvas
+    canvas.delete("all")
+    w = max(canvas.winfo_width(), 400); h = max(canvas.winfo_height(), 300)
+    points: List[Tuple[float, float, str, str, str]] = []
+    # kind, label, tooltip is stored in tuple with visual role.
+    if self.map_show_people.get():
+        for p in self.analyzer.person_infos():
+            pos = _v7_pos_tuple(p.raw.get("pos"))
+            if pos:
+                points.append((pos[0], pos[2], "person", self.analyzer.human_name(p.cid), ""))
+    if self.map_show_items.get():
+        for it in self.obj.get("interactables", [])[:1200] if self.obj else []:
+            if isinstance(it, dict):
+                pos = _v7_pos_tuple(it.get("wPos") or it.get("spWPos"))
+                if pos:
+                    points.append((pos[0], pos[2], "item", str(it.get("p") or it.get("lp") or it.get("id")), ""))
+    if self.map_show_murders.get():
+        for m in self.analyzer.murder_timeline():
+            raw = m.get("raw", {})
+            pos = _v7_pos_tuple(raw.get("sniperKillShotNode") or raw.get("victimSite") or raw.get("location"))
+            if pos:
+                points.append((pos[0], pos[1], "murder", f"{m['murder']} {m['victim']}", ""))
+    # fallback: if murder coordinates absent, plot current murderer/victim positions.
+    for hid, kind in ((self.obj.get("currentMurderer") if self.obj else None, "murderer"), (self.obj.get("currentVictim") if self.obj else None, "victim")):
+        if isinstance(hid, int):
+            c = next((x for x in self.obj.get("citizens", []) if isinstance(x, dict) and x.get("id") == hid), None)
+            pos = _v7_pos_tuple(c.get("pos")) if c else None
+            if pos:
+                points.append((pos[0], pos[2], kind, self.analyzer.human_name(hid), ""))
+    if not points:
+        canvas.create_text(w/2, h/2, text="Нет координат для карты", fill="#d8dde8", font=("Segoe UI", 12))
+        return
+    xs = [p[0] for p in points]; ys = [p[1] for p in points]
+    minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+    if maxx == minx: maxx += 1
+    if maxy == miny: maxy += 1
+    pad = 36
+    def tx(x): return pad + (x - minx) / (maxx - minx) * (w - pad*2)
+    def ty(y): return h - pad - (y - miny) / (maxy - miny) * (h - pad*2)
+    canvas.create_rectangle(pad, pad, w-pad, h-pad, outline="#273246")
+    if self.map_show_heat.get():
+        heat = [p for p in points if p[2] in ("murder", "murderer", "victim")]
+        for x, y, _kind, _label, _ in heat:
+            canvas.create_oval(tx(x)-24, ty(y)-24, tx(x)+24, ty(y)+24, outline="#70324a", width=2)
+            canvas.create_oval(tx(x)-10, ty(y)-10, tx(x)+10, ty(y)+10, fill="#8a3554", outline="")
+    for x, y, kind, label, _ in points[:2500]:
+        r = 3
+        fill = "#d8dde8"
+        if kind in ("murder", "murderer"): fill = "#ff5f7e"; r = 6
+        elif kind == "victim": fill = "#ffbd66"; r = 5
+        elif kind == "item": fill = "#77a7ff"; r = 2
+        canvas.create_oval(tx(x)-r, ty(y)-r, tx(x)+r, ty(y)+r, fill=fill, outline="")
+        if kind in ("murder", "murderer", "victim"):
+            canvas.create_text(tx(x)+8, ty(y)-8, text=label[:38], fill="#d8dde8", anchor="w", font=("Segoe UI", 9))
+    canvas.create_text(12, 12, text=f"points={len(points)} | people/items/murders are approximate 2D positions", fill="#9aa5b5", anchor="nw", font=("Segoe UI", 9))
+
+
+def _v7_populate_inventory(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "inventory_tree"):
+        return
+    self._inventory_cache = self.analyzer.inventory_infos(self.inventory_filter.get() if hasattr(self, "inventory_filter") else "")
+    self.inventory_tree.delete(*self.inventory_tree.get_children())
+    for i, r in enumerate(self._inventory_cache):
+        self.inventory_tree.insert("", "end", iid=str(i), values=(r["kind"], r["slot"], r["hotkey"], r["id"], r["name"], r["owner"], r["room"]))
+    self.after(80, lambda: self.autofit_tree(self.inventory_tree))
+
+
+def _v7_on_inventory_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.inventory_tree.selection() if hasattr(self, "inventory_tree") else []
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx >= len(getattr(self, "_inventory_cache", [])):
+        return
+    r = self._inventory_cache[idx]
+    self.inventory_details.delete("1.0", "end")
+    self.inventory_details.insert("1.0", json.dumps(r.get("raw"), ensure_ascii=False, indent=2)[:160_000])
+
+
+def _v7_set_carried_from_selected_inventory(self: SodbEditorApp) -> None:
+    if not self.obj or not hasattr(self, "inventory_tree"):
+        return
+    sel = self.inventory_tree.selection()
+    if not sel:
+        return
+    idx = int(sel[0]); r = self._inventory_cache[idx]
+    try:
+        iid = int(str(r.get("id")))
+    except Exception:
+        messagebox.showinfo("Inventory", "У выбранной строки нет числового interactableID.")
+        return
+    self.obj["carried"] = iid
+    self.mark_dirty(f"carried установлен на {iid}")
+    self.populate_inventory()
+
+
+def _v7_populate_sync_disks(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "sync_tree"):
+        return
+    self._sync_cache = self.analyzer.sync_disk_infos(self.sync_filter.get() if hasattr(self, "sync_filter") else "")
+    self.sync_tree.delete(*self.sync_tree.get_children())
+    for i, r in enumerate(self._sync_cache):
+        self.sync_tree.insert("", "end", iid=str(i), values=(r["idx"], r["upgrade"], r["state"], r["level"], r["list"], r["objId"], r["cost"]))
+    self.after(80, lambda: self.autofit_tree(self.sync_tree))
+
+
+def _v7_on_sync_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.sync_tree.selection() if hasattr(self, "sync_tree") else []
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx >= len(getattr(self, "_sync_cache", [])):
+        return
+    r = self._sync_cache[idx]
+    self.sync_details.delete("1.0", "end")
+    self.sync_details.insert("1.0", json.dumps(r.get("raw"), ensure_ascii=False, indent=2)[:120_000])
+
+
+def _v7_set_selected_sync_level(self: SodbEditorApp) -> None:
+    _v7_set_selected_sync_field(self, "level")
+
+
+def _v7_set_selected_sync_state(self: SodbEditorApp) -> None:
+    _v7_set_selected_sync_field(self, "state")
+
+
+def _v7_set_selected_sync_field(self: SodbEditorApp, field_name: str) -> None:
+    if not self.obj or not hasattr(self, "sync_tree"):
+        return
+    sel = self.sync_tree.selection()
+    if not sel:
+        return
+    row = self._sync_cache[int(sel[0])]
+    idx = int(row["idx"])
+    current = self.obj.get("upgrades", [])[idx].get(field_name)
+    value = simpledialog.askinteger("Sync disk", f"Новое значение {field_name}", initialvalue=int(current or 0), parent=self)
+    if value is None:
+        return
+    self.obj["upgrades"][idx][field_name] = value
+    self.mark_dirty(f"Sync disk {idx}: {field_name}={value}")
+    self.populate_sync_disks()
+
+
+def _v7_populate_apartments(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "apartment_tree"):
+        return
+    self._apartment_cache = self.analyzer.apartment_infos(self.apartment_filter.get() if hasattr(self, "apartment_filter") else "")
+    self.apartment_tree.delete(*self.apartment_tree.get_children())
+    for i, r in enumerate(self._apartment_cache):
+        self.apartment_tree.insert("", "end", iid=str(i), values=(r["address_id"], r["address"], r["rooms"], r["residents"], r["passwords"], r["owned"]))
+    self.after(80, lambda: self.autofit_tree(self.apartment_tree))
+
+
+def _v7_on_apartment_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.apartment_tree.selection() if hasattr(self, "apartment_tree") else []
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx >= len(getattr(self, "_apartment_cache", [])):
+        return
+    r = self._apartment_cache[idx]
+    self.apartment_details.delete("1.0", "end")
+    self.apartment_details.insert("1.0", f"{r['address_id']}\n{r['address']}\nRooms: {r['rooms']}\nResidents: {r['residents']}\nPasswords: {r['passwords']}\nOwned: {r['owned']}\n\nRAW ADDRESS:\n" + json.dumps(r.get("raw"), ensure_ascii=False, indent=2)[:120_000])
+
+
+def _v7_populate_city_stats(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "stats_tree"):
+        return
+    self.stats_tree.delete(*self.stats_tree.get_children())
+    for i, (metric, value, note) in enumerate(self.analyzer.city_statistics()):
+        self.stats_tree.insert("", "end", iid=str(i), values=(metric, value, note))
+    self.after(80, lambda: self.autofit_tree(self.stats_tree))
+
+
+def _v7_populate_json_inspector_top(self: SodbEditorApp) -> None:
+    if not self.obj or not hasattr(self, "json_tree"):
+        return
+    self._json_cache = {}
+    self.json_tree.delete(*self.json_tree.get_children())
+    for k in sorted(self.obj.keys()):
+        v = self.obj[k]
+        if isinstance(v, list): typ, summary = "list", f"{len(v)} items"
+        elif isinstance(v, dict): typ, summary = "dict", f"{len(v)} keys"
+        else: typ, summary = type(v).__name__, str(v)[:300]
+        self._json_cache[k] = v
+        self.json_tree.insert("", "end", iid=k, values=(k, typ, summary))
+    self.after(80, lambda: self.autofit_tree(self.json_tree))
+
+
+def _v7_search_json_inspector(self: SodbEditorApp) -> None:
+    if not self.obj or not hasattr(self, "json_tree"):
+        return
+    q = self.json_inspector_search.get().strip().lower()
+    if not q:
+        self.populate_json_inspector_top()
+        return
+    self._json_cache = {}
+    self.json_tree.delete(*self.json_tree.get_children())
+    count = 0
+    for path, val in _v7_walk_limited(self.obj, "$", max_depth=7):
+        text = _v7_hay(path, val)
+        if q not in text:
+            continue
+        key = f"hit:{count}"
+        self._json_cache[key] = val
+        self.json_tree.insert("", "end", iid=key, values=(path, type(val).__name__, str(val)[:700]))
+        count += 1
+        if count >= 700:
+            break
+    self.status_var.set(f"JSON Inspector: {count} совпадений")
+    self.after(80, lambda: self.autofit_tree(self.json_tree))
+
+
+def _v7_on_json_inspector_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.json_tree.selection() if hasattr(self, "json_tree") else []
+    if not sel:
+        return
+    key = sel[0]
+    val = getattr(self, "_json_cache", {}).get(key)
+    self.json_details.delete("1.0", "end")
+    try:
+        self.json_details.insert("1.0", json.dumps(val, ensure_ascii=False, indent=2)[:240_000])
+    except Exception:
+        self.json_details.insert("1.0", str(val))
+
+
+# ------------------------------- refresh/clear/help -------------------------------
+
+def _v7_refresh_all(self: SodbEditorApp) -> None:
+    _v6_refresh_all(self)
+    if getattr(self, "detective_tab", None) is not None and getattr(self, "detective_mode_var", None) and self.detective_mode_var.get():
+        self.populate_detective_all()
+
+
+def _v7_clear_state(self: SodbEditorApp) -> None:
+    _v6_clear_state(self)
+    extra_trees = ("det_search_tree", "timeline_tree", "inventory_tree", "sync_tree", "apartment_tree", "stats_tree", "json_tree")
+    for name in extra_trees:
+        tree = getattr(self, name, None)
+        if tree is not None:
+            try: tree.delete(*tree.get_children())
+            except Exception: pass
+    for name in ("det_search_details", "det_profile_text", "timeline_details", "inventory_details", "sync_details", "apartment_details", "json_details"):
+        txt = getattr(self, name, None)
+        if txt is not None:
+            try: txt.delete("1.0", "end")
+            except Exception: pass
+    if hasattr(self, "det_map_canvas"):
+        self.det_map_canvas.delete("all")
+    for name in ("det_search_var", "det_profile_var", "inventory_filter", "sync_filter", "apartment_filter", "json_inspector_search"):
+        var = getattr(self, name, None)
+        if var is not None:
+            try: var.set("")
+            except Exception: pass
+
+
+def _v7_autofit_all_trees(self: SodbEditorApp) -> None:
+    _v6_autofit_all_trees(self)
+    for name in ("det_search_tree", "timeline_tree", "inventory_tree", "sync_tree", "apartment_tree", "stats_tree", "json_tree"):
+        tree = getattr(self, name, None)
+        if tree is not None:
+            self.autofit_tree(tree)
+
+
+def _v7_export_current_table_csv(self: SodbEditorApp) -> None:
+    current = self.nb.select()
+    tab_text = self.nb.tab(current, "text") if current else ""
+    if tab_text == "Detective Mode" and getattr(self, "detective_nb", None) is not None:
+        sub = self.detective_nb.select()
+        sub_text = self.detective_nb.tab(sub, "text") if sub else ""
+        mapping = {
+            "Поиск всего": (getattr(self, "det_search_tree", None), "global_search.csv"),
+            "Timeline убийств": (getattr(self, "timeline_tree", None), "murder_timeline.csv"),
+            "Инвентарь": (getattr(self, "inventory_tree", None), "inventory.csv"),
+            "Sync disks": (getattr(self, "sync_tree", None), "sync_disks.csv"),
+            "Квартиры": (getattr(self, "apartment_tree", None), "apartments.csv"),
+            "Статистика": (getattr(self, "stats_tree", None), "city_statistics.csv"),
+            "JSON Inspector": (getattr(self, "json_tree", None), "json_inspector.csv"),
+        }
+        tree, default_name = mapping.get(sub_text, (None, "detective.csv"))
+        if tree is not None:
+            self._tree_to_csv(tree, default_name)
+            return
+    _v6_export_current_table_csv(self)
+
+
+def _v7_show_help(self: SodbEditorApp) -> None:
+    _v6_show_help(self)
+    # Keep the original help small; the Detective Mode header contains the usage hints.
+
+
+# Attach v7 extensions/overrides. Save original style method before replacing.
+_old_setup_style = SodbEditorApp._setup_style
+SodbEditorApp._setup_style = _v7_setup_compact_style
+SodbEditorApp._build_ui = _v7_build_ui
+SodbEditorApp.toggle_detective_mode = _v7_toggle_detective_mode
+SodbEditorApp.open_detective_search = _v7_open_detective_search
+SodbEditorApp._build_detective_mode_tab = _v7_build_detective_mode_tab
+SodbEditorApp._build_det_global_tab = _v7_build_det_global_tab
+SodbEditorApp._build_det_profile_tab = _v7_build_det_profile_tab
+SodbEditorApp._build_det_timeline_tab = _v7_build_det_timeline_tab
+SodbEditorApp._build_det_map_tab = _v7_build_det_map_tab
+SodbEditorApp._build_det_inventory_tab = _v7_build_det_inventory_tab
+SodbEditorApp._build_det_sync_tab = _v7_build_det_sync_tab
+SodbEditorApp._build_det_apartments_tab = _v7_build_det_apartments_tab
+SodbEditorApp._build_det_stats_tab = _v7_build_det_stats_tab
+SodbEditorApp._build_det_json_tab = _v7_build_det_json_tab
+SodbEditorApp.populate_detective_all = _v7_populate_detective_all
+SodbEditorApp.run_global_search = _v7_run_global_search
+SodbEditorApp.on_global_search_select = _v7_on_global_search_select
+SodbEditorApp._find_person_from_query = _v7_find_person_from_query
+SodbEditorApp.show_detective_profile = _v7_show_detective_profile
+SodbEditorApp.detective_profile_from_selected_person = _v7_detective_profile_from_selected_person
+SodbEditorApp.populate_timeline = _v7_populate_timeline
+SodbEditorApp.on_timeline_select = _v7_on_timeline_select
+SodbEditorApp.draw_detective_map = _v7_draw_detective_map
+SodbEditorApp.populate_inventory = _v7_populate_inventory
+SodbEditorApp.on_inventory_select = _v7_on_inventory_select
+SodbEditorApp.set_carried_from_selected_inventory = _v7_set_carried_from_selected_inventory
+SodbEditorApp.populate_sync_disks = _v7_populate_sync_disks
+SodbEditorApp.on_sync_select = _v7_on_sync_select
+SodbEditorApp.set_selected_sync_level = _v7_set_selected_sync_level
+SodbEditorApp.set_selected_sync_state = _v7_set_selected_sync_state
+SodbEditorApp.populate_apartments = _v7_populate_apartments
+SodbEditorApp.on_apartment_select = _v7_on_apartment_select
+SodbEditorApp.populate_city_stats = _v7_populate_city_stats
+SodbEditorApp.populate_json_inspector_top = _v7_populate_json_inspector_top
+SodbEditorApp.search_json_inspector = _v7_search_json_inspector
+SodbEditorApp.on_json_inspector_select = _v7_on_json_inspector_select
+SodbEditorApp.refresh_all = _v7_refresh_all
+SodbEditorApp.clear_state = _v7_clear_state
+SodbEditorApp.autofit_all_trees = _v7_autofit_all_trees
+SodbEditorApp.export_current_table_csv = _v7_export_current_table_csv
+SodbEditorApp.show_help = _v7_show_help
+
+
+
+# v7 small visual upgrade for the existing relation graph tab: relation colors + legend.
+def _v7_draw_graph_canvas_upgraded(self: SodbEditorApp, cid: int, edges: List[RelationInfo]) -> None:
+    canvas = self.graph_canvas
+    canvas.delete("all")
+    canvas.update_idletasks()
+    w = max(canvas.winfo_width(), 900)
+    h = max(canvas.winfo_height(), 600)
+    cx, cy = w // 2, h // 2
+    radius = max(185, min(w, h) // 3)
+
+    def rel_color(kind: str) -> str:
+        k = (kind or "").lower()
+        if "murder" in k or "killer" in k or "victim" in k:
+            return "#ff5f7e"
+        if "company" in k or "work" in k or "roster" in k:
+            return "#77a7ff"
+        if "home" in k or "room" in k or "address" in k:
+            return "#7bd88f"
+        if "sighting" in k or "seen" in k:
+            return "#ffbd66"
+        if "tie" in k or "evidence" in k:
+            return "#c792ea"
+        return "#b85c7b"
+
+    def node(x: float, y: float, label: str, fill: str, outline: str = "#ff87a7") -> None:
+        canvas.create_oval(x - 56, y - 32, x + 56, y + 32, fill=fill, outline=outline, width=2)
+        canvas.create_text(x, y - 6, text=label[:20], fill="#ffffff", font=("Segoe UI", 9, "bold"), width=104)
+
+    for gx in range(0, w, 48):
+        canvas.create_line(gx, 0, gx, h, fill="#151b2a")
+    for gy in range(0, h, 48):
+        canvas.create_line(0, gy, w, gy, fill="#151b2a")
+
+    legend = [("crime", "#ff5f7e"), ("work", "#77a7ff"), ("home/room", "#7bd88f"), ("sighting", "#ffbd66"), ("evidence", "#c792ea")]
+    lx, ly = 14, 14
+    for label, color in legend:
+        canvas.create_rectangle(lx, ly, lx + 12, ly + 12, fill=color, outline="")
+        canvas.create_text(lx + 18, ly + 6, text=label, fill="#aeb7c6", anchor="w", font=("Segoe UI", 8))
+        ly += 18
+
+    node(cx, cy, self.analyzer.human_name(cid), "#7b2d46", "#ffd1dc")
+    if not edges:
+        canvas.create_text(cx, cy + 75, text="Связи не найдены", fill="#d8dde8", font=("Segoe UI", 12))
+        return
+
+    for i, e in enumerate(edges[:48]):
+        angle = 2 * math.pi * i / max(min(len(edges), 48), 1) - math.pi / 2
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+        color = rel_color(e.kind)
+        canvas.create_line(cx, cy, x, y, fill=color, width=2)
+        midx, midy = (cx + x) / 2, (cy + y) / 2
+        canvas.create_text(midx, midy, text=e.kind.split(",")[0][:24], fill=color, font=("Segoe UI", 8), width=150)
+        node(x, y, self.analyzer.human_name(e.dst), "#20283a", color)
+
+SodbEditorApp._draw_graph_canvas = _v7_draw_graph_canvas_upgraded
+
+
+
+# ---------------------------------------------------------------------------
+# v8: better table layout/scrollbars + SyncDisk installer
+# ---------------------------------------------------------------------------
+
+SYNC_DISK_CATALOG: List[Tuple[str, str]] = [
+    ("BlackMarket-Infiltrator", "Infiltrator"),
+    ("BlackMarket-Interceptor", "Interceptor"),
+    ("BlackMarket-Trespasser", "Trespasser"),
+    ("Candor-Cartographer", "Cartographer"),
+    ("Candor-Community", "Community"),
+    ("Candor-ModelCitizen", "Model Citizen"),
+    ("Candor-PublicService", "Public Service"),
+    ("ElGen-Beauty", "Beauty"),
+    ("ElGen-Constitution", "Constitution"),
+    ("ElGen-Frame", "Frame"),
+    ("ElGen-Physique", "Physique"),
+    ("ElGen-Tenacity", "Tenacity"),
+    ("ElGen-Vigor", "Vigor"),
+    ("Kaizen-DovePlus", "Kaizen V-Love Plus / DovePlus"),
+    ("Kensington-AmbassadorScheme", "Ambassador Scheme"),
+    ("Kensington-SpartanInsuranceSchemes", "Spartan Insurance"),
+    ("Starch-BrandAmbassador", "Starch Brand Ambassador"),
+    ("Starch-SugarDaddy", "Sugar Daddy"),
+]
+SYNC_DISK_CODES = [x[0] for x in SYNC_DISK_CATALOG]
+
+
+def _v8_make_tree(parent: tk.Widget, columns: Tuple[str, ...], specs: List[Tuple[str, int]], bind_select=None) -> ttk.Treeview:
+    """Treeview helper with reliable vertical+horizontal scrolling and non-compressed columns."""
+    frame = ttk.Frame(parent, style="Panel.TFrame")
+    frame.pack(fill="both", expand=True)
+    tree = ttk.Treeview(frame, columns=columns, show="headings")
+    y = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    x = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+    for col, width in specs:
+        tree.heading(col, text=col)
+        tree.column(col, width=width, minwidth=55, anchor="w", stretch=False)
+    tree.grid(row=0, column=0, sticky="nsew")
+    y.grid(row=0, column=1, sticky="ns")
+    x.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+    if bind_select:
+        tree.bind("<<TreeviewSelect>>", bind_select)
+    tree._sodb_scrollbars_attached = True  # type: ignore[attr-defined]
+    return tree
+
+# Make future builder functions use the improved helper.
+_v6_make_tree = _v8_make_tree
+
+
+def _v8_attach_scrollbars_to_existing_tree(tree: ttk.Treeview) -> None:
+    """Attach scrollbars to older Treeviews created before v6_make_tree was introduced."""
+    try:
+        if getattr(tree, "_sodb_scrollbars_attached", False):
+            return
+        parent = tree.master
+        if parent is None:
+            return
+        # If the tree already has both x/y callbacks, it probably lives inside a scroll frame.
+        if str(tree.cget("xscrollcommand")) and str(tree.cget("yscrollcommand")):
+            tree._sodb_scrollbars_attached = True  # type: ignore[attr-defined]
+            return
+        manager = tree.winfo_manager()
+        if manager == "pack":
+            tree.pack_forget()
+        elif manager == "grid":
+            tree.grid_forget()
+        y = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        x = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+        try:
+            tree.grid(row=0, column=0, sticky="nsew")
+            y.grid(row=0, column=1, sticky="ns")
+            x.grid(row=1, column=0, sticky="ew")
+            parent.rowconfigure(0, weight=1)
+            parent.columnconfigure(0, weight=1)
+        except tk.TclError:
+            # Fallback for containers already managed by pack.
+            tree.pack(side="left", fill="both", expand=True)
+            y.pack(side="right", fill="y")
+            x.pack(side="bottom", fill="x")
+        tree._sodb_scrollbars_attached = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _v8_attach_all_scrollbars(self: SodbEditorApp) -> None:
+    tree_names = (
+        "cases_tree", "people_tree", "passwords_tree", "criminals_tree", "graph_tree", "search_tree",
+        "companies_tree", "validation_tree", "backups_tree", "items_tree", "address_tree",
+        "det_search_tree", "timeline_tree", "inventory_tree", "sync_tree", "apartment_tree", "stats_tree", "json_tree",
+    )
+    for name in tree_names:
+        tree = getattr(self, name, None)
+        if isinstance(tree, ttk.Treeview):
+            _v8_attach_scrollbars_to_existing_tree(tree)
+
+
+def _v8_autofit_tree(self: SodbEditorApp, tree: ttk.Treeview, max_rows: int = 350) -> None:
+    """Content-based column sizing.
+
+    Unlike older versions, this does not shrink all columns into the visible area.
+    Wide data keeps readable widths and the horizontal scrollbar does the rest.
+    """
+    try:
+        import tkinter.font as tkfont
+        font_name = tree.cget("font") or "TkDefaultFont"
+        try:
+            font = tkfont.nametofont(font_name)
+        except Exception:
+            font = tkfont.nametofont("TkDefaultFont")
+        cols = list(tree["columns"])
+        if not cols:
+            return
+        self._attach_all_scrollbars()
+        widths: Dict[str, int] = {}
+        for col in cols:
+            text = str(tree.heading(col, "text") or col)
+            widths[col] = max(65, font.measure(text) + 34)
+        for row_i, iid in enumerate(tree.get_children("")):
+            if row_i >= max_rows:
+                break
+            vals = tree.item(iid, "values")
+            for col, val in zip(cols, vals):
+                sample = str(val)
+                # Keep meaningful columns readable without letting one giant JSON cell eat the UI.
+                if len(sample) > 140:
+                    sample = sample[:140] + "…"
+                widths[col] = max(widths[col], min(720, font.measure(sample) + 38))
+        for col in cols:
+            tree.column(col, width=max(65, widths[col]), minwidth=55, stretch=False)
+        try:
+            tree.update_idletasks()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _v8_autofit_all_trees(self: SodbEditorApp) -> None:
+    self._attach_all_scrollbars()
+    for name in (
+        "cases_tree", "people_tree", "passwords_tree", "criminals_tree", "graph_tree", "search_tree",
+        "companies_tree", "validation_tree", "backups_tree", "items_tree", "address_tree",
+        "det_search_tree", "timeline_tree", "inventory_tree", "sync_tree", "apartment_tree", "stats_tree", "json_tree",
+    ):
+        tree = getattr(self, name, None)
+        if isinstance(tree, ttk.Treeview):
+            self.autofit_tree(tree)
+
+
+def _v8_autofit_visible_tree(self: SodbEditorApp) -> None:
+    self._attach_all_scrollbars()
+    # Fit the visible regular tab.
+    try:
+        current = self.nb.select() if hasattr(self, "nb") else ""
+        tab_text = self.nb.tab(current, "text") if current else ""
+        by_tab = {
+            "Кейсы": "cases_tree", "Люди / связи": "people_tree", "Пароли": "passwords_tree",
+            "Убийцы / криминалы": "criminals_tree", "Граф связей": "graph_tree",
+            "Поиск evidence/interactables": "search_tree", "Предметы / где лежит": "items_tree",
+            "Адреса / комнаты": "address_tree", "Компании / работы": "companies_tree",
+            "Валидатор / бэкапы": "validation_tree",
+        }
+        tree = getattr(self, by_tab.get(tab_text, ""), None)
+        if isinstance(tree, ttk.Treeview):
+            self.autofit_tree(tree)
+    except Exception:
+        pass
+    # Fit the visible Detective subtab.
+    try:
+        if getattr(self, "detective_nb", None) is not None:
+            sub = self.detective_nb.select()
+            sub_text = self.detective_nb.tab(sub, "text") if sub else ""
+            by_sub = {
+                "Поиск всего": "det_search_tree", "Timeline убийств": "timeline_tree", "Инвентарь": "inventory_tree",
+                "Sync disks": "sync_tree", "Квартиры": "apartment_tree", "Статистика": "stats_tree", "JSON Inspector": "json_tree",
+            }
+            tree = getattr(self, by_sub.get(sub_text, ""), None)
+            if isinstance(tree, ttk.Treeview):
+                self.autofit_tree(tree)
+    except Exception:
+        pass
+
+
+def _v8_setup_style(self: SodbEditorApp) -> None:
+    _old_setup_style(self)
+    try:
+        style = ttk.Style(self)
+        style.configure("Detective.TFrame", background="#0e1118")
+        style.configure("Card.TFrame", background="#171d29")
+        style.configure("CardTitle.TLabel", background="#171d29", foreground="#ff9db7", font=("Segoe UI", 12, "bold"))
+        style.configure("CardHint.TLabel", background="#171d29", foreground="#aeb7c6", font=("Segoe UI", 9))
+        style.configure("TButton", font=("Segoe UI", 9), padding=(7, 4))
+        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"), padding=(7, 4))
+        style.configure("TNotebook.Tab", padding=(10, 6), font=("Segoe UI", 9))
+        style.configure("Treeview", rowheight=25, font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+    except Exception:
+        pass
+
+
+def _v8_build_ui(self: SodbEditorApp) -> None:
+    _v7_build_ui(self)
+    self._attach_all_scrollbars()
+    # Keep layout readable after resizing and after switching any notebook level.
+    try:
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self.after(160, self.autofit_visible_tree), add="+")
+    except Exception:
+        pass
+
+
+def _v8_toggle_detective_mode(self: SodbEditorApp) -> None:
+    _v7_toggle_detective_mode(self)
+    self._attach_all_scrollbars()
+    try:
+        if getattr(self, "detective_nb", None) is not None:
+            self.detective_nb.bind("<<NotebookTabChanged>>", lambda _e: self.after(160, self.autofit_visible_tree), add="+")
+    except Exception:
+        pass
+    self.after(160, self.autofit_visible_tree)
+
+
+def _v8_build_det_sync_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Sync disks")
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Фильтр:").pack(side="left")
+    self.sync_filter = tk.StringVar()
+    ttk.Entry(toolbar, textvariable=self.sync_filter, width=28).pack(side="left", padx=6)
+    self.sync_filter.trace_add("write", lambda *_: self.populate_sync_disks())
+    ttk.Button(toolbar, text="Добавить", command=self.add_sync_disk_dialog).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Добавить все missing", command=self.add_all_missing_sync_disks).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Удалить", command=self.delete_selected_sync_disk).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Set level", command=self.set_selected_sync_level).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Set state", command=self.set_selected_sync_state).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Экспорт CSV", command=lambda: self._tree_to_csv(self.sync_tree, "sync_disks.csv")).pack(side="left", padx=4)
+    ttk.Label(toolbar, text="state = выбранная ветка, level = уровень апгрейда; перед overwrite делай бэкап.", style="Hint.TLabel").pack(side="left", padx=10)
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Frame(paned, style="Panel.TFrame")
+    right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3)
+    paned.add(right, weight=2)
+    cols = ("idx", "upgrade", "display", "state", "level", "list", "objId", "cost")
+    specs = [("idx", 60), ("upgrade", 260), ("display", 210), ("state", 70), ("level", 70), ("list", 70), ("objId", 110), ("cost", 80)]
+    self.sync_tree = _v8_make_tree(left, cols, specs, self.on_sync_select)
+    self.sync_details = _v7_text_in(right)
+    self._sync_cache: List[Dict[str, Any]] = []
+
+
+def _v8_sync_disk_display_name(code: str) -> str:
+    for c, name in SYNC_DISK_CATALOG:
+        if c == code:
+            return name
+    return "—"
+
+
+def _v8_populate_sync_disks(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "sync_tree"):
+        return
+    self._sync_cache = self.analyzer.sync_disk_infos(self.sync_filter.get() if hasattr(self, "sync_filter") else "")
+    self.sync_tree.delete(*self.sync_tree.get_children())
+    columns = list(self.sync_tree["columns"])
+    for i, r in enumerate(self._sync_cache):
+        values = {
+            "idx": r.get("idx", ""),
+            "upgrade": r.get("upgrade", ""),
+            "display": _v8_sync_disk_display_name(str(r.get("upgrade", ""))),
+            "state": r.get("state", ""),
+            "level": r.get("level", ""),
+            "list": r.get("list", ""),
+            "objId": r.get("objId", ""),
+            "cost": r.get("cost", ""),
+        }
+        self.sync_tree.insert("", "end", iid=str(i), values=tuple(values.get(c, "") for c in columns))
+    self.after(80, lambda: self.autofit_tree(self.sync_tree))
+
+
+def _v8_on_sync_select(self: SodbEditorApp, _event=None) -> None:
+    sel = self.sync_tree.selection() if hasattr(self, "sync_tree") else []
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx >= len(getattr(self, "_sync_cache", [])):
+        return
+    r = self._sync_cache[idx]
+    code = str(r.get("upgrade", ""))
+    text = (
+        f"Code: {code}\n"
+        f"Name: {_v8_sync_disk_display_name(code)}\n"
+        f"State/path: {r.get('state')}\n"
+        f"Level: {r.get('level')}\n"
+        f"List slot: {r.get('list')}\n"
+        f"objId: {r.get('objId')}\n"
+        f"uninstallCost: {r.get('cost')}\n\n"
+        "RAW:\n" + json.dumps(r.get("raw"), ensure_ascii=False, indent=2)[:120_000]
+    )
+    self.sync_details.delete("1.0", "end")
+    self.sync_details.insert("1.0", text)
+
+
+def _v8_next_sync_list_value(self: SodbEditorApp) -> int:
+    vals: List[int] = []
+    for u in self.obj.get("upgrades", []) if self.obj else []:
+        if isinstance(u, dict) and isinstance(u.get("list"), int):
+            vals.append(u["list"])
+    return (max(vals) + 1) if vals else 0
+
+
+def _v8_add_or_update_sync_disk(self: SodbEditorApp, code: str, state: int = 1, level: int = 0, quiet: bool = False) -> str:
+    if not self.obj:
+        raise RuntimeError("Сначала открой сейв.")
+    if code not in SYNC_DISK_CODES:
+        raise RuntimeError(f"Неизвестный SyncDisk code: {code}")
+    upgrades = self.obj.setdefault("upgrades", [])
+    if not isinstance(upgrades, list):
+        raise RuntimeError("obj['upgrades'] не является списком; безопасно добавить диск нельзя.")
+    for idx, u in enumerate(upgrades):
+        if isinstance(u, dict) and u.get("upgrade") == code:
+            if not quiet and not messagebox.askyesno("Sync disk", f"{code} уже есть. Обновить state/level?"):
+                return "skip"
+            u["state"] = int(state)
+            u["level"] = int(level)
+            u.setdefault("objId", -1)
+            u.setdefault("uninstallCost", 0)
+            if not isinstance(u.get("list"), int):
+                u["list"] = idx
+            return "updated"
+    upgrades.append({
+        "upgrade": code,
+        "state": int(state),
+        "list": self._next_sync_list_value(),
+        "level": int(level),
+        "objId": -1,
+        "uninstallCost": 0,
+    })
+    return "added"
+
+
+def _v8_add_sync_disk_dialog(self: SodbEditorApp) -> None:
+    if not self.obj:
+        messagebox.showinfo("Sync disk", "Сначала открой сейв.")
+        return
+    win = tk.Toplevel(self)
+    win.title("Добавить SyncDisk")
+    win.geometry("560x260")
+    win.configure(bg="#10131a")
+    win.transient(self)
+    win.grab_set()
+    frame = ttk.Frame(win, style="Panel.TFrame")
+    frame.pack(fill="both", expand=True, padx=14, pady=14)
+    ttk.Label(frame, text="SyncDisk:").grid(row=0, column=0, sticky="e", padx=6, pady=8)
+    catalog_values = [f"{code} — {name}" for code, name in SYNC_DISK_CATALOG]
+    code_var = tk.StringVar(value=catalog_values[0])
+    cb = ttk.Combobox(frame, textvariable=code_var, values=catalog_values, state="readonly", width=48)
+    cb.grid(row=0, column=1, columnspan=2, sticky="ew", padx=6, pady=8)
+    ttk.Label(frame, text="state / ветка:").grid(row=1, column=0, sticky="e", padx=6, pady=8)
+    state_var = tk.IntVar(value=1)
+    ttk.Spinbox(frame, from_=0, to=3, textvariable=state_var, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=8)
+    ttk.Label(frame, text="level:").grid(row=2, column=0, sticky="e", padx=6, pady=8)
+    level_var = tk.IntVar(value=0)
+    ttk.Spinbox(frame, from_=0, to=3, textvariable=level_var, width=8).grid(row=2, column=1, sticky="w", padx=6, pady=8)
+    hint = "0–3 обычно безопасный диапазон. Если не уверен: state=1, level=0."
+    ttk.Label(frame, text=hint, style="Hint.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 12))
+
+    def do_add() -> None:
+        try:
+            code = code_var.get().split(" — ", 1)[0].strip()
+            result = self._add_or_update_sync_disk(code, int(state_var.get()), int(level_var.get()))
+            if result != "skip":
+                self.mark_dirty(f"SyncDisk {code}: {result}")
+                if self.obj:
+                    self.analyzer = SodbAnalyzer(self.obj)
+                self.populate_sync_disks()
+                self.after(80, lambda: self.autofit_tree(self.sync_tree))
+            win.destroy()
+        except Exception as e:
+            messagebox.showerror("Sync disk", str(e), parent=win)
+
+    btns = ttk.Frame(frame, style="Panel.TFrame")
+    btns.grid(row=4, column=0, columnspan=3, sticky="e", pady=(8, 0))
+    ttk.Button(btns, text="Добавить / обновить", command=do_add).pack(side="left", padx=4)
+    ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="left", padx=4)
+    frame.columnconfigure(1, weight=1)
+    cb.focus_set()
+
+
+def _v8_add_all_missing_sync_disks(self: SodbEditorApp) -> None:
+    if not self.obj:
+        messagebox.showinfo("Sync disks", "Сначала открой сейв.")
+        return
+    if not messagebox.askyesno("Sync disks", "Добавить все отсутствующие SyncDisk'и?\n\nБудут добавлены state=1, level=0. Перед overwrite будет доступен бэкап."):
+        return
+    try:
+        existing = {u.get("upgrade") for u in self.obj.get("upgrades", []) if isinstance(u, dict)}
+        added = 0
+        for code in SYNC_DISK_CODES:
+            if code not in existing:
+                self._add_or_update_sync_disk(code, state=1, level=0, quiet=True)
+                added += 1
+        if self.obj:
+            self.analyzer = SodbAnalyzer(self.obj)
+        self.mark_dirty(f"Добавлены missing SyncDisk: {added}")
+        self.populate_sync_disks()
+        self.status_var.set(f"Добавлены отсутствующие SyncDisk: {added}")
+    except Exception as e:
+        messagebox.showerror("Sync disks", str(e))
+
+
+def _v8_delete_selected_sync_disk(self: SodbEditorApp) -> None:
+    if not self.obj or not hasattr(self, "sync_tree"):
+        return
+    sel = self.sync_tree.selection()
+    if not sel:
+        messagebox.showinfo("Sync disk", "Выбери диск в таблице.")
+        return
+    row = self._sync_cache[int(sel[0])]
+    idx = int(row["idx"])
+    code = str(row.get("upgrade", ""))
+    if not messagebox.askyesno("Sync disk", f"Удалить установленный SyncDisk?\n\n{code}"):
+        return
+    try:
+        del self.obj.get("upgrades", [])[idx]
+        if self.obj:
+            self.analyzer = SodbAnalyzer(self.obj)
+        self.mark_dirty(f"Удалён SyncDisk {code}")
+        self.populate_sync_disks()
+    except Exception as e:
+        messagebox.showerror("Sync disk", str(e))
+
+
+def _v8_refresh_all(self: SodbEditorApp) -> None:
+    _v7_refresh_all(self)
+    self._attach_all_scrollbars()
+    self.after(150, self.autofit_all_trees)
+
+
+def _v8_clear_state(self: SodbEditorApp) -> None:
+    _v7_clear_state(self)
+    self._attach_all_scrollbars()
+
+
+# Attach v8 patches.
+SodbEditorApp._setup_style = _v8_setup_style
+SodbEditorApp._build_ui = _v8_build_ui
+SodbEditorApp._attach_all_scrollbars = _v8_attach_all_scrollbars
+SodbEditorApp.autofit_tree = _v8_autofit_tree
+SodbEditorApp.autofit_all_trees = _v8_autofit_all_trees
+SodbEditorApp.autofit_visible_tree = _v8_autofit_visible_tree
+SodbEditorApp.toggle_detective_mode = _v8_toggle_detective_mode
+SodbEditorApp._build_det_sync_tab = _v8_build_det_sync_tab
+SodbEditorApp.populate_sync_disks = _v8_populate_sync_disks
+SodbEditorApp.on_sync_select = _v8_on_sync_select
+SodbEditorApp._next_sync_list_value = _v8_next_sync_list_value
+SodbEditorApp._add_or_update_sync_disk = _v8_add_or_update_sync_disk
+SodbEditorApp.add_sync_disk_dialog = _v8_add_sync_disk_dialog
+SodbEditorApp.add_all_missing_sync_disks = _v8_add_all_missing_sync_disks
+SodbEditorApp.delete_selected_sync_disk = _v8_delete_selected_sync_disk
+SodbEditorApp.refresh_all = _v8_refresh_all
+SodbEditorApp.clear_state = _v8_clear_state
+
+
+# ---------------------------------------------------------------------------
+# v9: precise Detective Mode item tracker / item map by floor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrackedItemInfo:
+    idx: int
+    iid: str
+    preset: str
+    name: str
+    owner: str
+    room_id: str
+    room: str
+    address: str
+    floor_key: str
+    floor_label: str
+    x: float
+    y: float
+    z: float
+    position: str
+    evidence: str
+    raw: Dict[str, Any]
+
+
+def _v9_item_display_name(it: Dict[str, Any]) -> str:
+    parts = []
+    for key in ("p", "lp", "dds", "bo", "sd", "nEvKey"):
+        v = it.get(key)
+        if v not in (None, "", -1):
+            parts.append(str(v))
+    # Preserve order, remove duplicates.
+    seen = set()
+    out = []
+    for x in parts:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return " / ".join(out) if out else "Interactable"
+
+
+def _v9_item_world_pos(it: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
+    # wPos is the useful world coordinate. spWPos is a stable fallback stored by the game.
+    for key in ("wPos", "spWPos"):
+        pos = _v7_pos_tuple(it.get(key))
+        if pos:
+            return pos
+    return None
+
+
+def _v9_floor_info(self: SodbAnalyzer, it: Dict[str, Any], pos: Optional[Tuple[float, float, float]], room_id: Optional[int]) -> Tuple[str, str]:
+    room = self.room_by_id.get(room_id) if isinstance(room_id, int) else None
+    fid = room.get("fID") if isinstance(room, dict) else None
+    iid = room.get("iID") if isinstance(room, dict) else None
+    y = pos[1] if pos else None
+    if isinstance(fid, int):
+        label = f"fID={fid}"
+        if isinstance(iid, int):
+            label += f", iID={iid}"
+        if isinstance(y, (int, float)):
+            label += f", y={y:.1f}"
+        return f"fID:{fid}", label
+    if isinstance(y, (int, float)):
+        # Unknown room floor: keep exact height, grouped by 1-unit buckets so the user can filter it.
+        bucket = round(float(y), 1)
+        return f"y:{bucket:.1f}", f"y={bucket:.1f}"
+    return "unknown", "unknown"
+
+
+def _v9_tracked_item_infos(self: SodbAnalyzer, query: str = "", floor_filter: str = "all", limit: int = 8000) -> List[TrackedItemInfo]:
+    q = (query or "").strip().lower()
+    ff = (floor_filter or "all").strip()
+    rows: List[TrackedItemInfo] = []
+    for idx, it in enumerate(self.obj.get("interactables", []) or []):
+        if not isinstance(it, dict):
+            continue
+        pos = _v9_item_world_pos(it)
+        if not pos:
+            continue
+        iid = str(it.get("id", ""))
+        preset = str(it.get("p") or it.get("lp") or "Interactable")
+        name = _v9_item_display_name(it)
+        owner_id = it.get("w") if isinstance(it.get("w"), int) and it.get("w") > 0 else it.get("inv")
+        owner = self.human_name(owner_id) if isinstance(owner_id, int) and owner_id > 0 else "—"
+        room_id_val = it.get("r") if isinstance(it.get("r"), int) and it.get("r") >= 0 else None
+        room = self.room_label(room_id_val) if isinstance(room_id_val, int) else "—"
+        addr_id = self.room_address_map.get(room_id_val) if isinstance(room_id_val, int) else None
+        address = self.address_label(addr_id) if isinstance(addr_id, int) else "—"
+        floor_key, floor_label = self._tracked_item_floor_info(it, pos, room_id_val)
+        if ff not in ("", "all", "Все", "All") and floor_key != ff:
+            continue
+        evidence = str(it.get("nEvKey") or "—")
+        position = f"x={pos[0]:.2f}, y={pos[1]:.2f}, z={pos[2]:.2f}"
+        rawtxt = _v6_compact_json(it, 2600)
+        hay = _v7_hay(iid, preset, name, owner, room, address, floor_label, position, evidence, rawtxt)
+        if q and q not in hay:
+            continue
+        rows.append(TrackedItemInfo(
+            idx=idx,
+            iid=iid,
+            preset=preset or "—",
+            name=name,
+            owner=owner,
+            room_id=str(room_id_val) if isinstance(room_id_val, int) else "—",
+            room=room,
+            address=address,
+            floor_key=floor_key,
+            floor_label=floor_label,
+            x=float(pos[0]),
+            y=float(pos[1]),
+            z=float(pos[2]),
+            position=position,
+            evidence=evidence,
+            raw=it,
+        ))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _v9_tracked_item_floors(self: SodbAnalyzer, query: str = "") -> List[Tuple[str, str, int]]:
+    counts: Dict[str, int] = {}
+    for row in self.tracked_item_infos(query=query, floor_filter="all", limit=20000):
+        counts[row.floor_key] = counts.get(row.floor_key, 0) + 1
+
+    def label_for(key: str) -> str:
+        m = re.match(r"fID:(-?\d+)", key)
+        if m:
+            return f"fID={m.group(1)}"
+        m = re.match(r"y:(-?\d+(?:\.\d+)?)", key)
+        if m:
+            return f"y={float(m.group(1)):.1f}"
+        return key
+
+    def sort_key(pair: Tuple[str, int]):
+        key, _count = pair
+        m = re.match(r"fID:(-?\d+)", key)
+        if m:
+            return (0, int(m.group(1)), key)
+        m = re.match(r"y:(-?\d+(?:\.\d+)?)", key)
+        if m:
+            return (1, float(m.group(1)), key)
+        return (2, 0, key)
+
+    return [(key, label_for(key), count) for key, count in sorted(counts.items(), key=sort_key)]
+
+
+SodbAnalyzer._tracked_item_floor_info = _v9_floor_info
+SodbAnalyzer.tracked_item_infos = _v9_tracked_item_infos
+SodbAnalyzer.tracked_item_floors = _v9_tracked_item_floors
+
+
+def _v9_build_detective_mode_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.nb, style="Detective.TFrame")
+    self.detective_tab = tab
+    header = ttk.Frame(tab, style="Detective.TFrame")
+    header.pack(fill="x", padx=12, pady=(10, 6))
+    ttk.Label(header, text="Detective Mode", style="Title.TLabel").pack(side="left")
+    ttk.Label(header, text="  включаемая витрина: поиск, timeline, карта, трекер предметов, inventory, sync disks, квартиры, статистика, JSON", style="Hint.TLabel").pack(side="left", padx=8)
+    ttk.Button(header, text="Обновить", command=self.populate_detective_all).pack(side="right", padx=3)
+    ttk.Button(header, text="Скрыть", command=lambda: (self.detective_mode_var.set(False), self.toggle_detective_mode())).pack(side="right", padx=3)
+
+    self.detective_nb = ttk.Notebook(tab)
+    self.detective_nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+    self._build_det_global_tab()
+    self._build_det_profile_tab()
+    self._build_det_timeline_tab()
+    self._build_det_map_tab()
+    self._build_det_item_tracker_tab()
+    self._build_det_inventory_tab()
+    self._build_det_sync_tab()
+    self._build_det_apartments_tab()
+    self._build_det_stats_tab()
+    self._build_det_json_tab()
+
+
+def _v9_build_det_item_tracker_tab(self: SodbEditorApp) -> None:
+    tab = ttk.Frame(self.detective_nb, style="Panel.TFrame")
+    self.detective_nb.add(tab, text="Трекер предметов")
+
+    toolbar = ttk.Frame(tab, style="Panel.TFrame")
+    toolbar.pack(fill="x", padx=10, pady=(10, 4))
+    ttk.Label(toolbar, text="Предмет:").pack(side="left")
+    self.item_track_filter = tk.StringVar()
+    ent = ttk.Entry(toolbar, textvariable=self.item_track_filter, width=32)
+    ent.pack(side="left", padx=6)
+    ent.bind("<Return>", lambda _e: self.populate_item_tracker())
+    self.item_track_filter.trace_add("write", lambda *_: self._schedule_item_tracker_refresh())
+
+    ttk.Label(toolbar, text="Этаж:").pack(side="left", padx=(8, 0))
+    self.item_track_floor = tk.StringVar(value="all")
+    self.item_track_floor_combo = ttk.Combobox(toolbar, textvariable=self.item_track_floor, width=26, state="readonly", values=("all",))
+    self.item_track_floor_combo.pack(side="left", padx=6)
+    self.item_track_floor_combo.bind("<<ComboboxSelected>>", lambda _e: self.populate_item_tracker())
+
+    self.item_track_selected_only = tk.BooleanVar(value=False)
+    ttk.Checkbutton(toolbar, text="только выбранный", variable=self.item_track_selected_only, command=self.draw_item_tracker_map).pack(side="left", padx=8)
+    ttk.Button(toolbar, text="Найти на карте", command=self.focus_selected_tracked_item).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Копировать координаты", command=self.copy_selected_tracked_item_position).pack(side="left", padx=4)
+    ttk.Button(toolbar, text="Экспорт CSV", command=lambda: self._tree_to_csv(self.item_track_tree, "tracked_items.csv")).pack(side="left", padx=4)
+    ttk.Label(toolbar, text="пустой фильтр = все предметы; пример: Envelope / SealedEnvelope / SniperRifle", style="Hint.TLabel").pack(side="left", padx=10)
+
+    paned = ttk.Panedwindow(tab, orient="horizontal")
+    paned.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    left = ttk.Panedwindow(paned, orient="vertical")
+    right = ttk.Frame(paned, style="Panel.TFrame")
+    paned.add(left, weight=3)
+    paned.add(right, weight=2)
+
+    table_frame = ttk.Frame(left, style="Panel.TFrame")
+    detail_frame = ttk.Frame(left, style="Panel.TFrame")
+    left.add(table_frame, weight=3)
+    left.add(detail_frame, weight=1)
+
+    cols = ("id", "preset", "name", "owner", "floor", "room", "address", "x", "y", "z", "evidence")
+    specs = [
+        ("id", 100), ("preset", 170), ("name", 220), ("owner", 190), ("floor", 150),
+        ("room", 260), ("address", 290), ("x", 80), ("y", 80), ("z", 80), ("evidence", 120),
+    ]
+    self.item_track_tree = _v8_make_tree(table_frame, cols, specs, self.on_item_tracker_select)
+    self.item_track_details = _v7_text_in(detail_frame)
+
+    map_toolbar = ttk.Frame(right, style="Panel.TFrame")
+    map_toolbar.pack(fill="x", padx=4, pady=(0, 4))
+    ttk.Label(map_toolbar, text="Карта X/Z, высота Y и floorID берутся из world position + Room.fID", style="Hint.TLabel").pack(side="left")
+    self.item_track_canvas = tk.Canvas(right, bg="#0f1320", highlightthickness=0)
+    self.item_track_canvas.pack(fill="both", expand=True)
+    self.item_track_canvas.bind("<Configure>", lambda _e: self.draw_item_tracker_map())
+    self.item_track_canvas.bind("<Button-1>", self.on_item_tracker_map_click)
+
+    self._item_track_cache: List[TrackedItemInfo] = []
+    self._item_track_map_points: List[Tuple[float, float, int]] = []
+    self._item_track_refresh_job = None
+
+
+def _v9_schedule_item_tracker_refresh(self: SodbEditorApp) -> None:
+    try:
+        if getattr(self, "_item_track_refresh_job", None):
+            self.after_cancel(self._item_track_refresh_job)
+    except Exception:
+        pass
+    self._item_track_refresh_job = self.after(300, self.populate_item_tracker)
+
+
+def _v9_update_item_floor_combo(self: SodbEditorApp, query: str) -> None:
+    if not self.analyzer or not hasattr(self, "item_track_floor_combo"):
+        return
+    try:
+        floors = self.analyzer.tracked_item_floors(query)
+        values = ["all"] + [f"{key} — {label} ({count})" for key, label, count in floors]
+        current = self.item_track_floor.get() or "all"
+        current_key = current.split(" — ", 1)[0]
+        self.item_track_floor_combo.configure(values=values)
+        if current_key != "all" and not any(v.startswith(current_key + " —") for v in values):
+            self.item_track_floor.set("all")
+    except Exception:
+        pass
+
+
+def _v9_current_item_floor_key(self: SodbEditorApp) -> str:
+    raw = self.item_track_floor.get() if hasattr(self, "item_track_floor") else "all"
+    return (raw or "all").split(" — ", 1)[0]
+
+
+def _v9_populate_item_tracker(self: SodbEditorApp) -> None:
+    if not self.analyzer or not hasattr(self, "item_track_tree"):
+        return
+    q = self.item_track_filter.get() if hasattr(self, "item_track_filter") else ""
+    self._update_item_floor_combo(q)
+    floor_key = self._current_item_floor_key()
+    self._item_track_cache = self.analyzer.tracked_item_infos(q, floor_key, limit=8000)
+    self.item_track_tree.delete(*self.item_track_tree.get_children())
+    for i, it in enumerate(self._item_track_cache):
+        self.item_track_tree.insert("", "end", iid=str(i), values=(
+            it.iid, it.preset, it.name, it.owner, it.floor_label, it.room, it.address,
+            f"{it.x:.2f}", f"{it.y:.2f}", f"{it.z:.2f}", it.evidence,
+        ))
+    self.status_var.set(f"Трекер предметов: {len(self._item_track_cache)} item(s)")
+    self.after(80, lambda: self.autofit_tree(self.item_track_tree))
+    self.after(90, self.draw_item_tracker_map)
+
+
+def _v9_on_item_tracker_select(self: SodbEditorApp, _event=None) -> None:
+    if not hasattr(self, "item_track_tree") or not hasattr(self, "item_track_details"):
+        return
+    sel = self.item_track_tree.selection()
+    if not sel:
+        return
+    idx = int(sel[0])
+    if idx < 0 or idx >= len(getattr(self, "_item_track_cache", [])):
+        return
+    it = self._item_track_cache[idx]
+    text = (
+        f"Item {it.iid}\n"
+        f"Preset: {it.preset}\n"
+        f"Name: {it.name}\n"
+        f"Owner: {it.owner}\n"
+        f"Floor: {it.floor_label}\n"
+        f"Room: {it.room}\n"
+        f"Address: {it.address}\n"
+        f"Position: {it.position}\n"
+        f"Evidence: {it.evidence}\n\n"
+        "RAW:\n" + json.dumps(it.raw, ensure_ascii=False, indent=2)[:160_000]
+    )
+    self.item_track_details.delete("1.0", "end")
+    self.item_track_details.insert("1.0", text)
+    self.draw_item_tracker_map()
+
+
+def _v9_selected_tracked_item_index(self: SodbEditorApp) -> Optional[int]:
+    if not hasattr(self, "item_track_tree"):
+        return None
+    sel = self.item_track_tree.selection()
+    if not sel:
+        return None
+    try:
+        idx = int(sel[0])
+    except Exception:
+        return None
+    if 0 <= idx < len(getattr(self, "_item_track_cache", [])):
+        return idx
+    return None
+
+
+def _v9_focus_selected_tracked_item(self: SodbEditorApp) -> None:
+    idx = self._selected_tracked_item_index()
+    if idx is None:
+        messagebox.showinfo("Трекер предметов", "Выбери предмет в таблице.")
+        return
+    self.item_track_selected_only.set(True)
+    self.draw_item_tracker_map()
+    it = self._item_track_cache[idx]
+    self.status_var.set(f"Выделен Item {it.iid}: {it.preset} @ {it.position}")
+
+
+def _v9_copy_selected_tracked_item_position(self: SodbEditorApp) -> None:
+    idx = self._selected_tracked_item_index()
+    if idx is None:
+        messagebox.showinfo("Трекер предметов", "Выбери предмет в таблице.")
+        return
+    it = self._item_track_cache[idx]
+    text = f"Item {it.iid} | {it.preset} | {it.position} | {it.floor_label} | {it.room} | {it.address}"
+    self.clipboard_clear()
+    self.clipboard_append(text)
+    self.status_var.set("Координаты предмета скопированы")
+
+
+def _v9_draw_item_tracker_map(self: SodbEditorApp) -> None:
+    if not hasattr(self, "item_track_canvas"):
+        return
+    canvas = self.item_track_canvas
+    canvas.delete("all")
+    self._item_track_map_points = []
+    w = max(canvas.winfo_width(), 420)
+    h = max(canvas.winfo_height(), 320)
+    rows: List[TrackedItemInfo] = list(getattr(self, "_item_track_cache", []) or [])
+    selected_idx = self._selected_tracked_item_index()
+    if getattr(self, "item_track_selected_only", None) and self.item_track_selected_only.get() and selected_idx is not None:
+        rows = [self._item_track_cache[selected_idx]]
+    if not rows:
+        canvas.create_text(w / 2, h / 2, text="Нет предметов с координатами для текущего фильтра", fill="#d8dde8", font=("Segoe UI", 12))
+        return
+
+    xs = [r.x for r in rows]
+    zs = [r.z for r in rows]
+    minx, maxx = min(xs), max(xs)
+    minz, maxz = min(zs), max(zs)
+    if maxx == minx:
+        maxx += 1.0
+        minx -= 1.0
+    if maxz == minz:
+        maxz += 1.0
+        minz -= 1.0
+    pad = 42
+
+    def tx(x: float) -> float:
+        return pad + (x - minx) / (maxx - minx) * (w - pad * 2)
+
+    def tz(z: float) -> float:
+        return h - pad - (z - minz) / (maxz - minz) * (h - pad * 2)
+
+    canvas.create_rectangle(pad, pad, w - pad, h - pad, outline="#2c3952")
+    for i in range(1, 8):
+        gx = pad + (w - pad * 2) * i / 8
+        gy = pad + (h - pad * 2) * i / 8
+        canvas.create_line(gx, pad, gx, h - pad, fill="#151b2a")
+        canvas.create_line(pad, gy, w - pad, gy, fill="#151b2a")
+    canvas.create_text(pad, 18, text=f"X/Z map | floor={self._current_item_floor_key()} | items={len(rows)}", fill="#aeb7c6", anchor="w", font=("Segoe UI", 9))
+    canvas.create_text(w - pad, h - 16, text=f"x {minx:.1f}..{maxx:.1f} | z {minz:.1f}..{maxz:.1f}", fill="#647089", anchor="e", font=("Segoe UI", 8))
+
+    # Use a stable index lookup so clicking map can select the source row.
+    index_by_iid_and_pos = {(r.iid, round(r.x, 3), round(r.y, 3), round(r.z, 3)): i for i, r in enumerate(getattr(self, "_item_track_cache", []) or [])}
+    max_draw = 3000
+    for draw_i, r in enumerate(rows[:max_draw]):
+        sx, sy = tx(r.x), tz(r.z)
+        real_idx = index_by_iid_and_pos.get((r.iid, round(r.x, 3), round(r.y, 3), round(r.z, 3)), draw_i)
+        is_sel = selected_idx is not None and real_idx == selected_idx
+        fill = "#ff5f7e" if is_sel else "#77a7ff"
+        outline = "#ffd1dc" if is_sel else ""
+        radius = 7 if is_sel else 3
+        if "envelope" in (r.preset + " " + r.name).lower():
+            fill = "#ffbd66" if not is_sel else "#ff5f7e"
+            radius = max(radius, 5)
+        canvas.create_oval(sx - radius, sy - radius, sx + radius, sy + radius, fill=fill, outline=outline, width=2 if outline else 0)
+        self._item_track_map_points.append((sx, sy, real_idx))
+        if is_sel or len(rows) <= 80:
+            label = f"{r.preset} #{r.iid}"
+            canvas.create_text(sx + 8, sy - 8, text=label[:42], fill="#d8dde8", anchor="w", font=("Segoe UI", 8))
+    if len(rows) > max_draw:
+        canvas.create_text(w / 2, h - 18, text=f"Показаны первые {max_draw} из {len(rows)}. Уточни фильтр для точного предмета.", fill="#ffbd66", font=("Segoe UI", 9))
+
+    if selected_idx is not None and selected_idx < len(getattr(self, "_item_track_cache", [])):
+        r = self._item_track_cache[selected_idx]
+        canvas.create_rectangle(12, h - 82, min(w - 12, 720), h - 12, fill="#171d29", outline="#70324a")
+        canvas.create_text(24, h - 68, text=f"Selected: {r.preset} / Item {r.iid}", fill="#ffffff", anchor="w", font=("Segoe UI", 10, "bold"))
+        canvas.create_text(24, h - 48, text=f"{r.position} | {r.floor_label}", fill="#d8dde8", anchor="w", font=("Segoe UI", 9))
+        canvas.create_text(24, h - 28, text=f"{r.room} | {r.address}", fill="#aeb7c6", anchor="w", font=("Segoe UI", 8))
+
+
+def _v9_on_item_tracker_map_click(self: SodbEditorApp, event) -> None:
+    pts = getattr(self, "_item_track_map_points", []) or []
+    if not pts or not hasattr(self, "item_track_tree"):
+        return
+    best = None
+    best_d2 = 999999.0
+    for sx, sy, idx in pts:
+        d2 = (sx - event.x) ** 2 + (sy - event.y) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best = idx
+    if best is None or best_d2 > 24 ** 2:
+        return
+    iid = str(best)
+    if self.item_track_tree.exists(iid):
+        self.item_track_tree.selection_set(iid)
+        self.item_track_tree.see(iid)
+        self.on_item_tracker_select()
+
+
+def _v9_populate_detective_all(self: SodbEditorApp) -> None:
+    _v7_populate_detective_all(self)
+    if hasattr(self, "item_track_tree"):
+        self.populate_item_tracker()
+
+
+def _v9_clear_state(self: SodbEditorApp) -> None:
+    _v8_clear_state(self)
+    tree = getattr(self, "item_track_tree", None)
+    if tree is not None:
+        try:
+            tree.delete(*tree.get_children())
+        except Exception:
+            pass
+    txt = getattr(self, "item_track_details", None)
+    if txt is not None:
+        try:
+            txt.delete("1.0", "end")
+        except Exception:
+            pass
+    if hasattr(self, "item_track_canvas"):
+        self.item_track_canvas.delete("all")
+    for name, val in (("item_track_filter", ""), ("item_track_floor", "all")):
+        var = getattr(self, name, None)
+        if var is not None:
+            try:
+                var.set(val)
+            except Exception:
+                pass
+    self._item_track_cache = []
+    self._item_track_map_points = []
+
+
+def _v9_autofit_all_trees(self: SodbEditorApp) -> None:
+    _v8_autofit_all_trees(self)
+    tree = getattr(self, "item_track_tree", None)
+    if isinstance(tree, ttk.Treeview):
+        self.autofit_tree(tree)
+
+
+def _v9_autofit_visible_tree(self: SodbEditorApp) -> None:
+    _v8_autofit_visible_tree(self)
+    try:
+        if getattr(self, "detective_nb", None) is not None:
+            sub = self.detective_nb.select()
+            sub_text = self.detective_nb.tab(sub, "text") if sub else ""
+            if sub_text == "Трекер предметов" and isinstance(getattr(self, "item_track_tree", None), ttk.Treeview):
+                self.autofit_tree(self.item_track_tree)
+    except Exception:
+        pass
+
+
+def _v9_attach_all_scrollbars(self: SodbEditorApp) -> None:
+    _v8_attach_all_scrollbars(self)
+    tree = getattr(self, "item_track_tree", None)
+    if isinstance(tree, ttk.Treeview):
+        _v8_attach_scrollbars_to_existing_tree(tree)
+
+
+def _v9_export_current_table_csv(self: SodbEditorApp) -> None:
+    current = self.nb.select()
+    tab_text = self.nb.tab(current, "text") if current else ""
+    if tab_text == "Detective Mode" and getattr(self, "detective_nb", None) is not None:
+        sub = self.detective_nb.select()
+        sub_text = self.detective_nb.tab(sub, "text") if sub else ""
+        if sub_text == "Трекер предметов" and hasattr(self, "item_track_tree"):
+            self._tree_to_csv(self.item_track_tree, "tracked_items.csv")
+            return
+    _v7_export_current_table_csv(self)
+
+
+# Attach v9 patches.
+SodbEditorApp._build_detective_mode_tab = _v9_build_detective_mode_tab
+SodbEditorApp._build_det_item_tracker_tab = _v9_build_det_item_tracker_tab
+SodbEditorApp._schedule_item_tracker_refresh = _v9_schedule_item_tracker_refresh
+SodbEditorApp._update_item_floor_combo = _v9_update_item_floor_combo
+SodbEditorApp._current_item_floor_key = _v9_current_item_floor_key
+SodbEditorApp.populate_item_tracker = _v9_populate_item_tracker
+SodbEditorApp.on_item_tracker_select = _v9_on_item_tracker_select
+SodbEditorApp._selected_tracked_item_index = _v9_selected_tracked_item_index
+SodbEditorApp.focus_selected_tracked_item = _v9_focus_selected_tracked_item
+SodbEditorApp.copy_selected_tracked_item_position = _v9_copy_selected_tracked_item_position
+SodbEditorApp.draw_item_tracker_map = _v9_draw_item_tracker_map
+SodbEditorApp.on_item_tracker_map_click = _v9_on_item_tracker_map_click
+SodbEditorApp.populate_detective_all = _v9_populate_detective_all
+SodbEditorApp.clear_state = _v9_clear_state
+SodbEditorApp.autofit_all_trees = _v9_autofit_all_trees
+SodbEditorApp.autofit_visible_tree = _v9_autofit_visible_tree
+SodbEditorApp._attach_all_scrollbars = _v9_attach_all_scrollbars
+SodbEditorApp.export_current_table_csv = _v9_export_current_table_csv
+
 def main() -> None:
     if brotli is None:
         # GUI всё равно запустим, чтобы сообщение было видным.
