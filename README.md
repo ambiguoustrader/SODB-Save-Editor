@@ -1,4 +1,15 @@
-````md
+Да, понял. Проблема была в том, что я дал README **внутри общего code block**. В GitHub в файл `README.md` нужно вставлять **сам markdown без внешних**:
+
+````text
+```md
+...
+````
+
+````
+
+Вот нормальный вариант — копируй **начиная с `<p align="center">`**, без дополнительных обёрток:
+
+:::writing{variant="document" id="61827"}
 <p align="center">
   <img src="assets/icon.png" width="130" alt="SODB Save Editor icon">
 </p>
@@ -33,10 +44,10 @@
 
 Она позволяет открыть `.sodb` сейв, распаковать его, посмотреть внутренние игровые данные в нормальном виде и при необходимости аккуратно отредактировать отдельные значения.
 
-Примерно так:
+Примерный workflow:
 
 ```text
-.sodb save  →  decompress  →  JSON  →  view / search / edit  →  save back
+.sodb save → decompress → JSON → view / search / edit → save back
 ````
 
 Главная идея проекта — не заставлять копаться в огромном JSON вручную, а дать удобный интерфейс для:
@@ -60,13 +71,13 @@
 
 Скачать последнюю версию:
 
-**https://github.com/ambiguoustrader/SODB-Save-Editor/releases/latest**
+**[https://github.com/ambiguoustrader/SODB-Save-Editor/releases/latest](https://github.com/ambiguoustrader/SODB-Save-Editor/releases/latest)**
 
 README ведёт на `/releases/latest`, поэтому ссылку не нужно менять после каждого нового релиза.
 
 ---
 
-## Key Features
+## Features
 
 ### Save Management
 
@@ -81,8 +92,6 @@ README ведёт на `/releases/latest`, поэтому ссылку не ну
 * валидатор сейва;
 * проверка roundtrip encode/decode;
 * безопасная перезапись через `Backup + overwrite`.
-
----
 
 ### Player Editor
 
@@ -99,8 +108,6 @@ README ведёт на `/releases/latest`, поэтому ссылку не ну
 
 Также есть справка по значениям прямо внутри приложения.
 
----
-
 ### Cases
 
 Вкладка дел показывает:
@@ -113,8 +120,6 @@ README ведёт на `/releases/latest`, поэтому ссылку не ну
 * места;
 * связанные HumanID / RoomID / EvidenceID;
 * готовые ответы и resolveQuestions, если они есть в сейве.
-
----
 
 ### Citizens
 
@@ -131,8 +136,6 @@ README ведёт на `/releases/latest`, поэтому ссылку не ну
 * пароли, если они есть в сейве;
 * полную карточку человека.
 
----
-
 ### Passwords
 
 Отдельная вкладка для `passcodes`.
@@ -148,8 +151,6 @@ README ведёт на `/releases/latest`, поэтому ссылку не ну
 
 Важно: вкладка показывает только те пароли, которые реально есть в сейве.
 Если пароль человека ещё не сгенерирован или не сохранён в `passcodes`, редактор не сможет честно показать его как найденный.
-
----
 
 ### Items / Interactables
 
@@ -176,8 +177,6 @@ Note
 Vmail
 ```
 
----
-
 ### Rooms and Addresses
 
 Есть адресная книга:
@@ -191,8 +190,6 @@ Vmail
 * связанные предметы;
 * пароли комнат.
 
----
-
 ### Companies and Jobs
 
 Отдельная вкладка для компаний и рабочих мест:
@@ -204,21 +201,6 @@ Vmail
 * связанные комнаты;
 * рабочие места;
 * CompanyRoster.
-
----
-
-### CSV Export
-
-Таблицы можно экспортировать в CSV:
-
-* citizens;
-* passcodes;
-* cases;
-* items;
-* rooms;
-* companies;
-* evidence / interactables;
-* item tracker results.
 
 ---
 
@@ -339,9 +321,7 @@ owner
 
 Скачайте последнюю версию:
 
-```text
-https://github.com/ambiguoustrader/SODB-Save-Editor/releases/latest
-```
+[https://github.com/ambiguoustrader/SODB-Save-Editor/releases/latest](https://github.com/ambiguoustrader/SODB-Save-Editor/releases/latest)
 
 Запустите:
 
@@ -350,8 +330,6 @@ SODB_Save_Editor.exe
 ```
 
 Python для EXE-версии не нужен.
-
----
 
 ### Option 2 — Run from Source
 
@@ -464,10 +442,10 @@ No.
 
 ## Original Game
 
-* **Steam:** https://store.steampowered.com/app/986130/Shadows_of_Doubt/
-* **Official page:** https://colepowered.com/games/shadows-of-doubt/
-* **Developer:** https://colepowered.com/
-* **Publisher:** https://fireshinegames.co.uk/games/
+* **Steam:** [https://store.steampowered.com/app/986130/Shadows_of_Doubt/](https://store.steampowered.com/app/986130/Shadows_of_Doubt/)
+* **Official page:** [https://colepowered.com/games/shadows-of-doubt/](https://colepowered.com/games/shadows-of-doubt/)
+* **Developer:** [https://colepowered.com/](https://colepowered.com/)
+* **Publisher:** [https://fireshinegames.co.uk/games/](https://fireshinegames.co.uk/games/)
 
 ---
 
@@ -489,6 +467,4 @@ All trademarks, names, game data and related materials belong to their respectiv
 ## License
 
 See [`LICENSE`](LICENSE).
-
-```
-```
+:::
