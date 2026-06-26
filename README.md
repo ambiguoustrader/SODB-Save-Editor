@@ -26,7 +26,7 @@
 .sodb  →  JSON  →  анализ / редактирование  →  .sodb
 ```
 
-Программа ориентирована на удобный просмотр сейва без ручного копания в огромном JSON: кейсы, жители, связи, пароли, убийцы, криминальные флаги и основные параметры игрока выводятся в отдельных вкладках.
+Программа ориентирована на удобный просмотр сейва без ручного копания в огромном JSON: кейсы, жители, связи, пароли, убийцы, криминальные флаги, SyncDisk-апгрейды и основные параметры игрока выводятся в отдельных вкладках.
 
 > [!WARNING]
 > Это **неофициальный фанатский инструмент**. Он не связан с ColePowered Games, Fireshine Games или Steam. Перед перезаписью сохранения всегда делай бэкап.
@@ -68,8 +68,9 @@
 - вкладка **Компании / работы**: CompanyRoster, сотрудники, роли и продажи;
 - экспорт таблиц в CSV;
 - автоматическое уточнение RoomID через известные связи room → address;
-- увеличенное стартовое окно, горизонтальные скроллы и автоподбор ширины колонок;
+- улучшенный layout таблиц: горизонтальные/вертикальные скроллы на всех таблицах и автоподбор ширины без сжатия колонок;
 - JSON path editor для точечного просмотра/изменения значений;
+- Detective Mode → **Sync disks**: добавление одного SyncDisk, добавление всех отсутствующих дисков, удаление выбранного диска, редактирование `state`/`level`;
 - кнопки **Очистить**, **Сбросить правки**, **?** со справкой.
 
 ## Установка и запуск из исходников
@@ -168,6 +169,7 @@ type=1  → код комнаты или локации
 - [x] Полная карточка человека.
 - [x] Полные ответы/выжимка по кейсам.
 - [x] Поиск предметов и их местоположения.
+- [x] Точный трекер предметов на карте Detective Mode с фильтром по этажу/координатам.
 - [x] Адресная книга RoomID → address.
 - [x] Автоподбор ширины колонок и горизонтальные скроллы таблиц.
 - [ ] Улучшить расшифровку названий адресов, если структура сейва изменится в новых версиях игры.
@@ -175,3 +177,20 @@ type=1  → код комнаты или локации
 ## Лицензия
 
 См. [`LICENSE`](LICENSE). Название `Shadows of Doubt`, игровые данные и связанные материалы принадлежат их правообладателям.
+
+
+## Detective Mode
+
+The default UI remains the normal save editor. Detective Mode is optional and hidden by default. Enable it from the top toolbar when you need investigation-style views:
+
+- global search across citizens, cases, passcodes, companies, items, rooms, evidence and interactables;
+- full NPC detective card;
+- murder timeline;
+- lightweight 2D map / heatmap;
+- item tracker with exact X/Y/Z coordinates, floor filter and selected-item map highlight;
+- inventory and Sync Disk views;
+- apartments/address view;
+- city statistics;
+- JSON Inspector.
+
+Shortcuts: `Ctrl+Shift+F` or `Ctrl+P` opens Detective Mode global search.
